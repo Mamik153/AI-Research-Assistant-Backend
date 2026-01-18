@@ -1,17 +1,42 @@
 research_task:
   description: >
-    Conduct a thorough research about {topic}
-    Make sure you find any interesting and relevant information given
-    the current year is {current_year}.
+    Conduct a thorough research about {topic} using Arxiv.
+    Use the Arxiv Search tool to find exactly 5 relevant scientific papers.
+    For each paper, capture the title, authors, publication date, URL, summary, and key insights.
+    Format your output as a simple text list with 5 main bullet points (one for each paper).
+    Each bullet point should start with "- [Paper Title]" and contain the relevant details.
+    Do not use JSON or any structured format - just plain text.
   expected_output: >
-    A list with 10 bullet points of the most relevant information about {topic}
+    A plain text list with exactly 10 bullet points (each starting with "- ") 
+    containing the most relevant information about {topic}.
+    Format: Plain text, not JSON or structured format.
   agent: researcher
 
 reporting_task:
   description: >
-    Review the context you got and expand each topic into a full section for a report.
-    Make sure the report is detailed and contains any and all relevant information.
+    Review the papers and generate a structured report.
+    The report MUST follow this exact structure:
+    # {topic}
+    (Introduction paragraph with citations)
+
+    ## Key Applications
+    (Paragraph describing applications with citations)
+
+    ## Benefits
+    (Paragraph describing benefits with citations)
+
+    ## Challenges
+    (Paragraph describing challenges with citations)
+
+    ## Conclusion
+    (Concluding paragraph)
+
+    Use inline markdown citations like `[Paper Title](url)` at the end of relevant sentences.
+    Do NOT include a separate "References" section at the end.
+    Format your output as plain markdown text. Do not use JSON or structured formats.
   expected_output: >
-    A fully fledged report with the main topics, each with a full section of information.
-    Formatted as markdown without '```'
+    A structured markdown report with sections: Introduction, Key Applications, Benefits, Challenges, Conclusion.
+    Citations must be inline: `[Paper Title](url)`.
+    No separate References section.
+    Output should be plain text markdown, not JSON.
   agent: reporting_analyst

@@ -21,7 +21,7 @@ uv sync
 
 ### Customizing
 
-**Add your `GEMINI_API_KEY` into the `.env` file**
+**Add your `GROQ_API_KEY` into the `.env` file**
 
 - Modify `src/ai_research_backend/config/agents.yaml` to define your agents
 - Modify `src/ai_research_backend/config/tasks.yaml` to define your tasks
