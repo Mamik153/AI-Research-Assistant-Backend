@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Dict, Optional, List
 from datetime import datetime
 
 
@@ -216,6 +216,14 @@ class DynamicResearchResultResponse(BaseModel):
     structured_sections: Optional[StructuredSections] = Field(
         default_factory=StructuredSections,
         description="UI-friendly structured sections for cards, graphs, timelines",
+    )
+    section_confidence: Optional[Dict[str, float]] = Field(
+        None,
+        description="Confidence score per section (0-1); keys match structured_sections",
+    )
+    section_images: Optional[Dict[str, List[str]]] = Field(
+        None,
+        description="Image URLs per section; keys match structured_sections",
     )
     completed_at: str = Field(..., description="ISO format timestamp of completion")
     jobId: str = Field(..., description="Job identifier")

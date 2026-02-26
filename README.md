@@ -83,7 +83,20 @@ The API will be available at `http://localhost:8000` with the following endpoint
 - **GET** `/api/research/{job_id}` - Get the status of a research job
 - **GET** `/api/research/{job_id}/result` - Get the research result when completed
 
-The API supports CORS for frontend requests from `http://localhost:5173`.
+The API supports CORS for frontend requests from `http://localhost:5173` and any subdomain of `slickspender.com`.
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_BASE_URL` | `http://localhost:8000` | Base URL prepended to image paths so the frontend receives absolute URLs (e.g. `https://api.slickspender.com`). |
+
+#### Dynamic Research Result Extras
+
+The `GET /api/research/dynamic/{job_id}/result` response includes:
+
+- **`section_confidence`** — Confidence score (0–1) per structured section, indicating how well it is supported by the retrieved papers.
+- **`section_images`** — Per-section image URLs: extracted paper figures assigned by the LLM, rendered LaTeX equations, and auto-generated data charts for statistics and comparisons.
 
 ## Understanding Your Crew
 

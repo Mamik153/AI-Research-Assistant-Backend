@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,15 +34,23 @@ from ai_research_backend.crew import AiResearchBackend
 
 logger = logging.getLogger(__name__)
 
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+
+SECTION_KEYS = frozenset({
+    "overview", "key_concepts", "benefits", "risks", "applications",
+    "future_directions", "methodologies", "comparisons", "timeline", "statistics",
+})
+
 app = FastAPI(title="AI Research Backend API", version="1.0.0")
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Frontend URL
+    allow_origins=["http://localhost:5173"],
+    allow_origin_regex=r"^https?://([a-z0-9-]+\.)*slickspender\.com(:\d+)?$",
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Mount static directory for serving images
@@ -59,7 +67,11 @@ async def delayed_cleanup(delay_seconds: int = 3600):
     
     # Paths to clean
     results_dir = os.path.join(os.getcwd(), "results")
-    extracted_images_dir = os.path.join(os.getcwd(), "static", "extracted_images")
+    dirs_to_clean = [
+        os.path.join(os.getcwd(), "static", "extracted_images"),
+        os.path.join(os.getcwd(), "static", "generated_math"),
+        os.path.join(os.getcwd(), "static", "generated_charts"),
+    ]
     
     # Clean results directory
     if os.path.exists(results_dir):
@@ -73,17 +85,18 @@ async def delayed_cleanup(delay_seconds: int = 3600):
             except Exception as e:
                 logger.error(f"Failed to delete {file_path}. Reason: {e}")
                 
-    # Clean extracted images directory
-    if os.path.exists(extracted_images_dir):
-        for filename in os.listdir(extracted_images_dir):
-            file_path = os.path.join(extracted_images_dir, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                logger.error(f"Failed to delete {file_path}. Reason: {e}")
+    # Clean static image directories
+    for dir_path in dirs_to_clean:
+        if os.path.exists(dir_path):
+            for filename in os.listdir(dir_path):
+                file_path = os.path.join(dir_path, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                except Exception as e:
+                    logger.error(f"Failed to delete {file_path}. Reason: {e}")
                 
     logger.info("Delayed cleanup completed.")
 
@@ -96,6 +109,49 @@ def _parse_structured_sections(data: Optional[dict]) -> StructuredSections:
         return StructuredSections(**data)
     except Exception:
         return StructuredSections()
+
+
+def _normalize_section_confidence(raw: Optional[dict]) -> Optional[Dict[str, float]]:
+    """Normalize section_confidence: keep only known keys, clamp values to [0, 1]."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    result = {}
+    for key in SECTION_KEYS:
+        val = raw.get(key)
+        if val is None:
+            continue
+        try:
+            score = float(val)
+            result[key] = max(0.0, min(1.0, score))
+        except (TypeError, ValueError):
+            continue
+    return result if result else None
+
+
+def _normalize_section_images(
+    raw: Optional[dict], allowed_urls: set[str],
+) -> Optional[Dict[str, List[str]]]:
+    """Normalize section_images: keep only known section keys and allowed image URLs."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    result: Dict[str, List[str]] = {}
+    for key in SECTION_KEYS:
+        urls = raw.get(key)
+        if not urls or not isinstance(urls, list):
+            continue
+        filtered = [u for u in urls if isinstance(u, str) and u in allowed_urls]
+        if filtered:
+            result[key] = filtered
+    return result if result else None
+
+
+def _to_absolute_url(path: str) -> str:
+    """Convert a relative image path to an absolute URL using API_BASE_URL."""
+    if not path or not isinstance(path, str):
+        return path
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return f"{API_BASE_URL}{path}" if path.startswith("/") else f"{API_BASE_URL}/{path}"
 
 
 def _unwrap_llm_response(llm_data: Optional[dict]) -> dict:
@@ -214,6 +270,79 @@ def _validate_llm_response(llm_data: dict) -> tuple[bool, str]:
         return False, "structured_sections is empty"
 
     return True, "OK"
+
+
+# Mermaid diagram types that we accept (must start with one of these, case-insensitive)
+_MERMAID_DIAGRAM_PREFIXES = (
+    "graph",
+    "flowchart",
+    "sequenceDiagram",
+    "classDiagram",
+    "stateDiagram",
+    "erDiagram",
+    "gantt",
+    "pie",
+    "journey",
+)
+# Minimal structure: at least one edge/arrow or node definition
+_MERMAID_EDGE_OR_NODE_RE = re.compile(
+    r"(-->|---|->|<-|==>|===|\|\||\[|\]|\(\)|\[\]|\{\})"
+)
+
+
+def _sanitize_mermaid(diagram: str) -> Optional[str]:
+    """Strip markdown code fences and trim. Returns None if empty after sanitization."""
+    if not diagram or not isinstance(diagram, str):
+        return None
+    s = diagram.strip()
+    # Remove ```mermaid and ``` wrappers
+    if s.startswith("```"):
+        lines = s.split("\n")
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines)
+    s = s.strip()
+    return s if s else None
+
+
+def _is_valid_mermaid(diagram: str) -> bool:
+    """Conservative check that the string looks like valid Mermaid (omit if not)."""
+    if not diagram or len(diagram) > 8000:
+        return False
+    first_line = diagram.split("\n")[0].strip()
+    if not first_line:
+        return False
+    # Must start with a known diagram type (e.g. "graph TD" or "flowchart LR")
+    prefix = first_line.split()[0] if first_line else ""
+    if not any(
+        prefix.lower().startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES
+    ):
+        return False
+    # Must contain at least one edge/arrow or node bracket so it's not plain text
+    if not _MERMAID_EDGE_OR_NODE_RE.search(diagram):
+        return False
+    return True
+
+
+def _filter_valid_mermaid_diagrams(diagrams: Optional[List[str]]) -> List[str]:
+    """Return only diagrams that pass sanitization and validation; omit the rest."""
+    if not diagrams or not isinstance(diagrams, list):
+        return []
+    result = []
+    for item in diagrams:
+        if not isinstance(item, str):
+            continue
+        sanitized = _sanitize_mermaid(item)
+        if sanitized and _is_valid_mermaid(sanitized):
+            result.append(sanitized)
+        else:
+            logger.debug(
+                "Omitting invalid or empty Mermaid diagram (length=%s)",
+                len(item) if item else 0,
+            )
+    return result
 
 
 def _parse_llm_response(response: str) -> dict:
@@ -528,27 +657,57 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 f"Analyzing {len(papers)} papers",
             )
 
-        # 2. Synthesize with LLM
+        # 2. Chunk papers and retrieve relevant passages via RAG
         from ai_research_backend.crew import active_llm
+        from ai_research_backend.rag import retrieve_relevant_chunks
 
-        # Prepare context from papers (use top 7 to reduce input size; 600 chars per content excerpt)
+        update_job_progress(
+            job_id,
+            "Chunking and embedding papers",
+            50,
+            "Splitting papers into semantic chunks and retrieving the most relevant passages",
+        )
+
         papers_for_context = papers[:7]
-        papers_context = ""
-        for i, p in enumerate(papers_for_context, 1):
-            content = (p.get("content") or "")[:600]
-            papers_context += f"Paper {i}: {p['title']}\nSummary: {p['summary']}\nContent: {content}...\n\n"
+        papers_context = retrieve_relevant_chunks(papers_for_context, topic)
+
+        # Build the list of available paper images for the LLM to assign
+        available_image_urls: List[str] = []
+        available_images_text = ""
+        for p in papers_for_context:
+            p_images = p.get("images", [])
+            if p_images:
+                available_image_urls.extend(p_images)
+                available_images_text += f'  - "{p.get("title", "Unknown")}": {", ".join(p_images)}\n'
+
+        section_images_instruction = ""
+        if available_image_urls:
+            section_images_instruction = f"""
+            "section_images": {{
+                For each section key (overview, key_concepts, benefits, risks, applications, future_directions, methodologies, comparisons, timeline, statistics), provide an array of image URLs from the Available Images list below that best illustrate that section. Use ONLY URLs from this list. Use empty array if none fit.
+                Example: "overview": ["/static/extracted_images/paper_p0_i0.png"], "key_concepts": [], ...
+            }},
+
+Available Images (use ONLY these URLs in section_images):
+{available_images_text}"""
+        else:
+            section_images_instruction = '"section_images": {},'
 
         prompt = f"""
         You are an expert AI researcher explaining the topic of "{topic}" to someone who wants to understand it deeply.
         
-        Based on the research papers provided below:
+        Below you will find paper abstracts and semantically retrieved excerpts from full papers.
+        Based on this material:
         1. Write a comprehensive, naturally-flowing summary (no "Paper 1 says..."; synthesize ideas).
         2. Extract key insights and create at least 1 Mermaid diagram.
         3. Fill in the "structured_sections" object so the frontend can render cards, graphs, timelines, and tables.
+        4. Rate your confidence (0.0-1.0) for each section based on how well it is supported by the research material.
+        5. Assign relevant paper images to sections (if available).
         
         SUMMARY GUIDELINES:
-        - Flowing narrative; do not mention "Paper 1", "Paper 2". Use transitions like "Furthermore", "Research shows that".
+        - Flowing narrative; do not mention "Paper 1", "Paper 2" or "Excerpt". Use transitions like "Furthermore", "Research shows that".
         - 3-5 detailed paragraphs. Be educational and engaging.
+        - Draw on both abstracts and the retrieved excerpts for depth.
         
         Return valid JSON only, with this exact structure (omit a section's key or use empty array/object if no data):
         {{
@@ -588,12 +747,25 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 "statistics": [
                     {{ "label": "Metric name", "value": "e.g. 2,500+", "context": "e.g. Published in 2025", "source": "e.g. ArXiv" or null }}
                 ]
-            }}
+            }},
+            "section_confidence": {{
+                "overview": 0.0 to 1.0,
+                "key_concepts": 0.0 to 1.0,
+                "benefits": 0.0 to 1.0,
+                "risks": 0.0 to 1.0,
+                "applications": 0.0 to 1.0,
+                "future_directions": 0.0 to 1.0,
+                "methodologies": 0.0 to 1.0,
+                "comparisons": 0.0 to 1.0,
+                "timeline": 0.0 to 1.0,
+                "statistics": 0.0 to 1.0
+            }},
+            {section_images_instruction}
         }}
         
-        Rules: Use only valid JSON. No markdown code fences. For generated_diagrams use Mermaid strings only (e.g. "graph TD; A --> B;"). Populate every section that the papers support; use empty arrays or null where no data. IMPORTANT: The "summary" field must be a single plain-text string (the narrative paragraphs), not a nested JSON object.
+        Rules: Use only valid JSON. No markdown code fences. For generated_diagrams use Mermaid strings only (e.g. "graph TD; A --> B;"). Populate every section that the papers support; use empty arrays or null where no data. IMPORTANT: The "summary" field must be a single plain-text string (the narrative paragraphs), not a nested JSON object. For section_confidence, rate each section 0.0 (no support) to 1.0 (strongly supported by papers). For section_images, use ONLY URLs from the Available Images list provided.
         
-        Research Papers:
+        Research Material:
         {papers_context}
         """
 
@@ -633,7 +805,14 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 "comparisons": null,
                 "timeline": [],
                 "statistics": []
-            }}
+            }},
+            "section_confidence": {{
+                "overview": 0.0-1.0, "key_concepts": 0.0-1.0, "benefits": 0.0-1.0,
+                "risks": 0.0-1.0, "applications": 0.0-1.0, "future_directions": 0.0-1.0,
+                "methodologies": 0.0-1.0, "comparisons": 0.0-1.0, "timeline": 0.0-1.0,
+                "statistics": 0.0-1.0
+            }},
+            "section_images": {{}}
         }}
         Research Papers:
         {papers_context}
@@ -656,6 +835,21 @@ def run_dynamic_research_job(job_id: str, topic: str):
         # Parse structured_sections from LLM output into validated model, then store as dict
         structured_sections = _parse_structured_sections(llm_data.get("structured_sections"))
 
+        # Normalize section_confidence
+        section_confidence = _normalize_section_confidence(
+            llm_data.get("section_confidence")
+        )
+
+        # Normalize section_images (only allow URLs that came from papers)
+        allowed_urls = set()
+        for p in papers:
+            for img_url in p.get("images", []):
+                if isinstance(img_url, str):
+                    allowed_urls.add(img_url)
+        section_images = _normalize_section_images(
+            llm_data.get("section_images"), allowed_urls
+        )
+
         update_job_progress(
             job_id,
             "Generating insights and diagrams",
@@ -663,19 +857,44 @@ def run_dynamic_research_job(job_id: str, topic: str):
             "Creating visualizations and extracting key insights",
         )
 
+        # Generate optional visual assets (math renders, data charts)
+        sections_dict = structured_sections.model_dump()
+        if section_images is None:
+            section_images = {}
+        try:
+            from ai_research_backend.section_visuals import (
+                render_section_math,
+                generate_statistics_chart,
+                generate_comparison_chart,
+            )
+            math_images = render_section_math(sections_dict, job_id, static_dir)
+            for key, urls in math_images.items():
+                section_images.setdefault(key, []).extend(urls)
+
+            stats_chart_url = generate_statistics_chart(sections_dict, job_id, static_dir)
+            if stats_chart_url:
+                section_images.setdefault("statistics", []).append(stats_chart_url)
+
+            comp_chart_url = generate_comparison_chart(sections_dict, job_id, static_dir)
+            if comp_chart_url:
+                section_images.setdefault("comparisons", []).append(comp_chart_url)
+        except Exception as e:
+            logger.warning("Section visual generation failed (non-fatal): %s", e)
+
         # Prepare result
         completed_at = datetime.now().isoformat()
-
-        # Ensure base URL for images if needed, but relative paths are fine for now as we mount /static
-        # The frontend should handle the base URL.
 
         result_data = {
             "topic": topic,
             "summary": llm_data.get("summary", ""),
             "papers": papers,
             "key_insights": llm_data.get("key_insights", []),
-            "generated_diagrams": llm_data.get("generated_diagrams", []),
-            "structured_sections": structured_sections.model_dump(),
+            "generated_diagrams": _filter_valid_mermaid_diagrams(
+                llm_data.get("generated_diagrams")
+            ),
+            "structured_sections": sections_dict,
+            "section_confidence": section_confidence,
+            "section_images": section_images if section_images else None,
             "completed_at": completed_at,
             "jobId": job_id,
         }
@@ -751,6 +970,22 @@ async def get_dynamic_research_result(job_id: str, background_tasks: BackgroundT
     else:
         structured_sections = StructuredSections()
 
+    # Convert image URLs to absolute so the frontend can load them from any origin
+    papers_data = result.get("papers", [])
+    for paper in papers_data:
+        if isinstance(paper, dict) and "images" in paper:
+            paper["images"] = [_to_absolute_url(u) for u in paper["images"]]
+
+    raw_section_images = result.get("section_images")
+    if isinstance(raw_section_images, dict):
+        section_images = {
+            k: [_to_absolute_url(u) for u in urls]
+            for k, urls in raw_section_images.items()
+            if isinstance(urls, list)
+        }
+    else:
+        section_images = None
+
     # Schedule delayed cleanup after returning the result
     # Delay is set to 3600 seconds (1 hour)
     background_tasks.add_task(delayed_cleanup, 3600)
@@ -758,10 +993,12 @@ async def get_dynamic_research_result(job_id: str, background_tasks: BackgroundT
     return DynamicResearchResultResponse(
         topic=result.get("topic", ""),
         summary=result.get("summary", ""),
-        papers=result.get("papers", []),
+        papers=papers_data,
         key_insights=result.get("key_insights", []),
         generated_diagrams=result.get("generated_diagrams", []),
         structured_sections=structured_sections,
+        section_confidence=result.get("section_confidence"),
+        section_images=section_images,
         completed_at=result.get("completed_at", ""),
         jobId=result.get("jobId", job_id),
     )
