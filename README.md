@@ -21,7 +21,28 @@ uv sync
 
 ### Customizing
 
-**Add your `GROQ_API_KEY` into the `.env` file**
+**Add your API keys into the `.env` file**
+
+This project currently uses **Ollama Cloud** by default, but you can easily switch back to **Groq**.
+
+For Ollama Cloud, ensure you have:
+```env
+OLLAMA_API_KEY=your_key_here
+OLLAMA_API_BASE=https://ollama.com/v1
+OLLAMA_MODEL=gpt-oss:120b-cloud
+```
+
+For Groq, ensure you have:
+```env
+GROQ_API_KEY=your_key_here
+```
+
+#### Comparing Groq vs Ollama
+To compare the outputs:
+1. Open `src/ai_research_backend/crew.py`.
+2. Uncomment the Groq LLM setup block.
+3. Change `active_llm = ollama_llm` to `active_llm = groq_llm`.
+4. Restart the server and run the same research topic to compare the generated `report.md` and structured data.
 
 - Modify `src/ai_research_backend/config/agents.yaml` to define your agents
 - Modify `src/ai_research_backend/config/tasks.yaml` to define your tasks

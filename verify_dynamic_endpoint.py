@@ -80,11 +80,42 @@ def test_dynamic_research():
         if result.get("generated_diagrams"):
             print(f"First Diagram Code:\n{result['generated_diagrams'][0][:100]}...")
 
+        # Verify structured_sections (UI-friendly sections)
+        sections = result.get("structured_sections") or {}
+        print("\nStructured Sections (UI format):")
+        for key in (
+            "overview",
+            "key_concepts",
+            "benefits",
+            "risks",
+            "applications",
+            "future_directions",
+            "methodologies",
+            "comparisons",
+            "timeline",
+            "statistics",
+        ):
+            val = sections.get(key)
+            if val is None:
+                count = "null"
+            elif isinstance(val, list):
+                count = len(val)
+            elif isinstance(val, dict):
+                count = "object"
+            else:
+                count = "?"
+            print(f"   - {key}: {count}")
+
         # Verify structure
         if "papers" in result and isinstance(result["papers"], list):
             print("\n✅ Verification Successful: 'papers' list present.")
         else:
             print("\n❌ Verification Failed: 'papers' list missing or invalid.")
+
+        if "structured_sections" in result and isinstance(result["structured_sections"], dict):
+            print("✅ 'structured_sections' present for UI (cards, graphs, timelines).")
+        else:
+            print("❌ 'structured_sections' missing or invalid.")
 
     else:
         print(f"   Error fetching result: {result_response.text}")
