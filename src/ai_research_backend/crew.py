@@ -56,7 +56,7 @@ import os
 # )
 # --------------------------------------
 
-# --- Ollama Cloud LLM Setup ---
+# --- Ollama Cloud LLM Setup (main model for synthesis) ---
 ollama_llm = LLM(
     model=f"openai/{os.getenv('OLLAMA_MODEL', 'gpt-oss:120b-cloud')}",
     base_url=os.getenv("OLLAMA_API_BASE", "https://ollama.com/v1"),
@@ -65,7 +65,19 @@ ollama_llm = LLM(
     max_tokens=8192,
 )
 
-# Single active LLM - switch to groq_llm when uncommented above to compare
+# --- Sub-agent LLM (smaller model for analysis / diagram generation) ---
+_sub_model = os.getenv("OLLAMA_SUB_MODEL", "")
+if _sub_model:
+    sub_llm = LLM(
+        model=f"openai/{_sub_model}",
+        base_url=os.getenv("OLLAMA_SUB_API_BASE", "http://localhost:11434/v1"),
+        api_key=os.getenv("OLLAMA_SUB_API_KEY", "ollama"),
+        temperature=0.5,
+        max_tokens=4096,
+    )
+else:
+    sub_llm = ollama_llm
+
 active_llm = ollama_llm
 
 # Initialize tool

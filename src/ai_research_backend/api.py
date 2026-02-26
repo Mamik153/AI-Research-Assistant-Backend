@@ -272,22 +272,23 @@ def _validate_llm_response(llm_data: dict) -> tuple[bool, str]:
     return True, "OK"
 
 
-# Mermaid diagram types that we accept (must start with one of these, case-insensitive)
 _MERMAID_DIAGRAM_PREFIXES = (
     "graph",
     "flowchart",
-    "sequenceDiagram",
-    "classDiagram",
-    "stateDiagram",
-    "erDiagram",
+    "sequencediagram",
+    "classdiagram",
+    "statediagram",
+    "erdiagram",
     "gantt",
     "pie",
     "journey",
 )
-# Minimal structure: at least one edge/arrow or node definition
+
 _MERMAID_EDGE_OR_NODE_RE = re.compile(
-    r"(-->|---|->|<-|==>|===|\|\||\[|\]|\(\)|\[\]|\{\})"
+    r"(-->|---|->|<-|==>|===|\|\||\[.*?\]|\(.*?\)|\{.*?\})"
 )
+
+_MERMAID_SPECIAL_LABEL_CHARS = re.compile(r'[():{}&<>"]')
 
 
 def _sanitize_mermaid(diagram: str) -> Optional[str]:
@@ -295,7 +296,6 @@ def _sanitize_mermaid(diagram: str) -> Optional[str]:
     if not diagram or not isinstance(diagram, str):
         return None
     s = diagram.strip()
-    # Remove ```mermaid and ``` wrappers
     if s.startswith("```"):
         lines = s.split("\n")
         if lines[0].strip().startswith("```"):
@@ -307,27 +307,64 @@ def _sanitize_mermaid(diagram: str) -> Optional[str]:
     return s if s else None
 
 
+def _format_mermaid_diagram(diagram: str) -> str:
+    """Reformat a Mermaid diagram string into well-structured multi-line syntax
+    that front-end parsers (mermaid-js) can reliably render."""
+    if not diagram:
+        return diagram
+
+    lines = diagram.split("\n")
+    if len(lines) == 1 and ";" in diagram:
+        parts = [p.strip() for p in diagram.split(";") if p.strip()]
+        lines = parts
+
+    output_lines: List[str] = []
+    for i, line in enumerate(lines):
+        line = line.rstrip(";").strip()
+        if not line:
+            continue
+        if i == 0:
+            first_token = line.split()[0].lower()
+            is_declaration = any(first_token.startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES)
+            if is_declaration:
+                output_lines.append(line)
+                continue
+
+        def _quote_label(match: re.Match) -> str:
+            bracket_open = match.group(1)
+            label = match.group(2)
+            bracket_close = match.group(3)
+            if _MERMAID_SPECIAL_LABEL_CHARS.search(label) and not label.startswith('"'):
+                label = '"' + label.replace('"', "'") + '"'
+            return bracket_open + label + bracket_close
+
+        line = re.sub(r'(\[)([^\]]+)(\])', _quote_label, line)
+        line = re.sub(r'(\(\()([^)]+)(\)\))', _quote_label, line)
+        line = re.sub(r'(\{)([^}]+)(\})', _quote_label, line)
+
+        if line:
+            output_lines.append("    " + line)
+
+    return "\n".join(output_lines)
+
+
 def _is_valid_mermaid(diagram: str) -> bool:
-    """Conservative check that the string looks like valid Mermaid (omit if not)."""
+    """Check that the string looks like valid Mermaid syntax."""
     if not diagram or len(diagram) > 8000:
         return False
     first_line = diagram.split("\n")[0].strip()
     if not first_line:
         return False
-    # Must start with a known diagram type (e.g. "graph TD" or "flowchart LR")
     prefix = first_line.split()[0] if first_line else ""
-    if not any(
-        prefix.lower().startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES
-    ):
+    if not any(prefix.lower().startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES):
         return False
-    # Must contain at least one edge/arrow or node bracket so it's not plain text
     if not _MERMAID_EDGE_OR_NODE_RE.search(diagram):
         return False
     return True
 
 
 def _filter_valid_mermaid_diagrams(diagrams: Optional[List[str]]) -> List[str]:
-    """Return only diagrams that pass sanitization and validation; omit the rest."""
+    """Sanitize, reformat, validate diagrams; return only those that pass."""
     if not diagrams or not isinstance(diagrams, list):
         return []
     result = []
@@ -335,11 +372,14 @@ def _filter_valid_mermaid_diagrams(diagrams: Optional[List[str]]) -> List[str]:
         if not isinstance(item, str):
             continue
         sanitized = _sanitize_mermaid(item)
-        if sanitized and _is_valid_mermaid(sanitized):
-            result.append(sanitized)
+        if not sanitized:
+            continue
+        formatted = _format_mermaid_diagram(sanitized)
+        if _is_valid_mermaid(formatted):
+            result.append(formatted)
         else:
             logger.debug(
-                "Omitting invalid or empty Mermaid diagram (length=%s)",
+                "Omitting invalid Mermaid diagram (length=%s)",
                 len(item) if item else 0,
             )
     return result
@@ -621,66 +661,100 @@ async def get_research_result(job_id: str):
 
 
 def run_dynamic_research_job(job_id: str, topic: str):
-    """Run the dynamic research job in background"""
+    """Run the dynamic research job in background.
+
+    Flow:
+      1. Check persistent knowledge base for existing relevant content
+      2. If insufficient, download papers from ArXiv and store in knowledge base
+      3. Run multi-agent pipeline (analyzer -> synthesis + diagrams in parallel)
+      4. Generate visual assets and prepare final result
+    """
     try:
         update_job_status(job_id, "running")
         update_job_progress(
             job_id,
-            "Initializing search",
+            "Initializing research",
             5,
-            "Preparing to search ArXiv for research papers",
+            "Preparing to research the topic",
         )
 
-        # Initialize tool
-        from ai_research_backend.tools.arxiv_tool import ArxivSearchTool
+        from ai_research_backend.crew import active_llm, sub_llm
+        from ai_research_backend.rag import (
+            search_existing_knowledge,
+            retrieve_relevant_chunks,
+        )
+        from ai_research_backend.agents import run_research_agents
 
-        arxiv_tool = ArxivSearchTool()
-
-        # 1. Search Papers
+        # ---- Step 1: Similarity search on existing knowledge base ----
         update_job_progress(
             job_id,
-            "Searching ArXiv papers",
-            20,
-            f"Searching for papers related to: {topic}",
+            "Checking knowledge base",
+            10,
+            "Searching existing embeddings for relevant material",
         )
-        papers = arxiv_tool.search_papers(topic)
 
-        # Add intermediate finding about papers found
-        if papers:
+        existing_context = search_existing_knowledge(topic)
+        papers: List[dict] = []
+        papers_context: str = ""
+
+        if existing_context:
             add_intermediate_finding(
-                job_id, f"Found {len(papers)} relevant research papers"
+                job_id,
+                "Found sufficient existing knowledge — skipping paper download",
             )
+            papers_context = existing_context
             update_job_progress(
                 job_id,
-                "Processing paper content",
-                40,
-                f"Analyzing {len(papers)} papers",
+                "Using cached knowledge",
+                45,
+                "Relevant content found in knowledge base, proceeding to analysis",
+            )
+        else:
+            # ---- Step 2: Download new papers from ArXiv ----
+            from ai_research_backend.tools.arxiv_tool import ArxivSearchTool
+
+            arxiv_tool = ArxivSearchTool()
+
+            update_job_progress(
+                job_id,
+                "Searching ArXiv papers",
+                20,
+                f"Searching for papers related to: {topic}",
+            )
+            papers = arxiv_tool.search_papers(topic)
+
+            if papers:
+                add_intermediate_finding(
+                    job_id, f"Found {len(papers)} relevant research papers"
+                )
+                update_job_progress(
+                    job_id,
+                    "Processing paper content",
+                    35,
+                    f"Analyzing {len(papers)} papers",
+                )
+
+            update_job_progress(
+                job_id,
+                "Embedding papers into knowledge base",
+                45,
+                "Storing paper chunks with rich metadata for semantic retrieval",
             )
 
-        # 2. Chunk papers and retrieve relevant passages via RAG
-        from ai_research_backend.crew import active_llm
-        from ai_research_backend.rag import retrieve_relevant_chunks
+            papers_for_context = papers[:7]
+            papers_context = retrieve_relevant_chunks(papers_for_context, topic)
 
-        update_job_progress(
-            job_id,
-            "Chunking and embedding papers",
-            50,
-            "Splitting papers into semantic chunks and retrieving the most relevant passages",
-        )
-
-        papers_for_context = papers[:7]
-        papers_context = retrieve_relevant_chunks(papers_for_context, topic)
-
-        # Build the list of available paper images for the LLM to assign
+        # ---- Build section_images_instruction for synthesis agent ----
         available_image_urls: List[str] = []
         available_images_text = ""
-        for p in papers_for_context:
+        for p in papers:
             p_images = p.get("images", [])
             if p_images:
                 available_image_urls.extend(p_images)
-                available_images_text += f'  - "{p.get("title", "Unknown")}": {", ".join(p_images)}\n'
+                available_images_text += (
+                    f'  - "{p.get("title", "Unknown")}": {", ".join(p_images)}\n'
+                )
 
-        section_images_instruction = ""
         if available_image_urls:
             section_images_instruction = f"""
             "section_images": {{
@@ -693,154 +767,37 @@ Available Images (use ONLY these URLs in section_images):
         else:
             section_images_instruction = '"section_images": {},'
 
-        prompt = f"""
-        You are an expert AI researcher explaining the topic of "{topic}" to someone who wants to understand it deeply.
-        
-        Below you will find paper abstracts and semantically retrieved excerpts from full papers.
-        Based on this material:
-        1. Write a comprehensive, naturally-flowing summary (no "Paper 1 says..."; synthesize ideas).
-        2. Extract key insights and create at least 1 Mermaid diagram.
-        3. Fill in the "structured_sections" object so the frontend can render cards, graphs, timelines, and tables.
-        4. Rate your confidence (0.0-1.0) for each section based on how well it is supported by the research material.
-        5. Assign relevant paper images to sections (if available).
-        
-        SUMMARY GUIDELINES:
-        - Flowing narrative; do not mention "Paper 1", "Paper 2" or "Excerpt". Use transitions like "Furthermore", "Research shows that".
-        - 3-5 detailed paragraphs. Be educational and engaging.
-        - Draw on both abstracts and the retrieved excerpts for depth.
-        
-        Return valid JSON only, with this exact structure (omit a section's key or use empty array/object if no data):
-        {{
-            "summary": "Your comprehensive narrative summary (3-5 paragraphs)...",
-            "key_insights": ["Insight 1", "Insight 2", ...],
-            "generated_diagrams": ["graph TD; A[Concept] --> B[Result];"],
-            "structured_sections": {{
-                "overview": {{ "title": "Short section title", "content": "Brief intro paragraph", "visualization_type": "card" }},
-                "key_concepts": [
-                    {{ "name": "Concept name", "description": "What it is", "related_concepts": ["Other concept", ...] }}
-                ],
-                "benefits": [
-                    {{ "title": "Benefit title", "description": "What it is", "importance": "high" or "medium" or "low" }}
-                ],
-                "risks": [
-                    {{ "title": "Risk title", "description": "What it is", "severity": "high" or "medium" or "low" }}
-                ],
-                "applications": [
-                    {{ "title": "Use case title", "description": "What it is", "industry": "e.g. Healthcare" or null }}
-                ],
-                "future_directions": [
-                    {{ "title": "Trend title", "description": "What it is", "timeframe": "e.g. Next 5 years" or null }}
-                ],
-                "methodologies": [
-                    {{ "name": "Method name", "description": "What it is", "use_cases": ["Use case 1", ...] }}
-                ],
-                "comparisons": {{
-                    "criteria": ["Criterion A", "Criterion B", ...],
-                    "items": [
-                        {{ "name": "Item 1", "values": ["value A", "value B", ...] }},
-                        {{ "name": "Item 2", "values": ["value A", "value B", ...] }}
-                    ]
-                }} or null if no comparison fits,
-                "timeline": [
-                    {{ "period": "e.g. 2020", "event": "What happened", "significance": "Why it matters" or null }}
-                ],
-                "statistics": [
-                    {{ "label": "Metric name", "value": "e.g. 2,500+", "context": "e.g. Published in 2025", "source": "e.g. ArXiv" or null }}
-                ]
-            }},
-            "section_confidence": {{
-                "overview": 0.0 to 1.0,
-                "key_concepts": 0.0 to 1.0,
-                "benefits": 0.0 to 1.0,
-                "risks": 0.0 to 1.0,
-                "applications": 0.0 to 1.0,
-                "future_directions": 0.0 to 1.0,
-                "methodologies": 0.0 to 1.0,
-                "comparisons": 0.0 to 1.0,
-                "timeline": 0.0 to 1.0,
-                "statistics": 0.0 to 1.0
-            }},
-            {section_images_instruction}
-        }}
-        
-        Rules: Use only valid JSON. No markdown code fences. For generated_diagrams use Mermaid strings only (e.g. "graph TD; A --> B;"). Populate every section that the papers support; use empty arrays or null where no data. IMPORTANT: The "summary" field must be a single plain-text string (the narrative paragraphs), not a nested JSON object. For section_confidence, rate each section 0.0 (no support) to 1.0 (strongly supported by papers). For section_images, use ONLY URLs from the Available Images list provided.
-        
-        Research Material:
-        {papers_context}
-        """
-
+        # ---- Step 3: Multi-agent pipeline ----
         update_job_progress(
             job_id,
-            "Synthesizing findings with LLM",
-            60,
-            "AI is analyzing papers and generating insights",
+            "Running research agents",
+            55,
+            "Paper Analyzer extracting findings, Synthesis + Diagram agents starting",
         )
 
-        # Call LLM and parse
-        response = active_llm.call(messages=[{"role": "user", "content": prompt}])
-        logger.info(
-            "LLM response length: %s chars, estimated tokens: ~%s",
-            len(response),
-            len(response) // 4,
+        llm_data = run_research_agents(
+            main_llm=active_llm,
+            sub_llm=sub_llm,
+            topic=topic,
+            papers_context=papers_context,
+            section_images_instruction=section_images_instruction,
         )
-        llm_data = _parse_llm_response(response)
+
+        logger.info("Multi-agent pipeline completed")
+
         valid, reason = _validate_llm_response(llm_data)
         if not valid:
-            logger.warning("LLM response validation failed: %s", reason)
-            # Single retry with simplified prompt (fewer sections to reduce output size)
-            simplified_prompt = f"""
-        Topic: "{topic}". Based on these research papers, return valid JSON only (no markdown fences). The "summary" must be plain text, not nested JSON.
-        {{
-            "summary": "3-5 paragraph narrative summary synthesizing the papers...",
-            "key_insights": ["Insight 1", "Insight 2", ...],
-            "generated_diagrams": ["graph TD; A[Concept] --> B[Result];"],
-            "structured_sections": {{
-                "overview": {{ "title": "Title", "content": "Brief intro", "visualization_type": "card" }},
-                "key_concepts": [{{ "name": "...", "description": "...", "related_concepts": [] }}],
-                "benefits": [{{ "title": "...", "description": "...", "importance": "high" or "medium" or "low" }}],
-                "risks": [{{ "title": "...", "description": "...", "severity": "high" or "medium" or "low" }}],
-                "applications": [],
-                "future_directions": [],
-                "methodologies": [],
-                "comparisons": null,
-                "timeline": [],
-                "statistics": []
-            }},
-            "section_confidence": {{
-                "overview": 0.0-1.0, "key_concepts": 0.0-1.0, "benefits": 0.0-1.0,
-                "risks": 0.0-1.0, "applications": 0.0-1.0, "future_directions": 0.0-1.0,
-                "methodologies": 0.0-1.0, "comparisons": 0.0-1.0, "timeline": 0.0-1.0,
-                "statistics": 0.0-1.0
-            }},
-            "section_images": {{}}
-        }}
-        Research Papers:
-        {papers_context}
-        """
-            response2 = active_llm.call(
-                messages=[{"role": "user", "content": simplified_prompt}]
-            )
-            llm_data2 = _parse_llm_response(response2)
-            valid2, _ = _validate_llm_response(llm_data2)
-            if valid2:
-                llm_data = llm_data2
-                logger.info("Retry with simplified prompt succeeded")
-            else:
-                logger.warning(
-                    "Retry with simplified prompt still invalid, using first attempt"
-                )
-        else:
-            logger.info("LLM response validation passed")
+            logger.warning("Agent pipeline output validation failed: %s — using raw output", reason)
 
-        # Parse structured_sections from LLM output into validated model, then store as dict
-        structured_sections = _parse_structured_sections(llm_data.get("structured_sections"))
+        # ---- Step 4: Post-process results ----
+        structured_sections = _parse_structured_sections(
+            llm_data.get("structured_sections")
+        )
 
-        # Normalize section_confidence
         section_confidence = _normalize_section_confidence(
             llm_data.get("section_confidence")
         )
 
-        # Normalize section_images (only allow URLs that came from papers)
         allowed_urls = set()
         for p in papers:
             for img_url in p.get("images", []):
@@ -852,12 +809,11 @@ Available Images (use ONLY these URLs in section_images):
 
         update_job_progress(
             job_id,
-            "Generating insights and diagrams",
+            "Generating visualizations",
             80,
-            "Creating visualizations and extracting key insights",
+            "Creating charts and rendering math expressions",
         )
 
-        # Generate optional visual assets (math renders, data charts)
         sections_dict = structured_sections.model_dump()
         if section_images is None:
             section_images = {}
@@ -867,21 +823,25 @@ Available Images (use ONLY these URLs in section_images):
                 generate_statistics_chart,
                 generate_comparison_chart,
             )
+
             math_images = render_section_math(sections_dict, job_id, static_dir)
             for key, urls in math_images.items():
                 section_images.setdefault(key, []).extend(urls)
 
-            stats_chart_url = generate_statistics_chart(sections_dict, job_id, static_dir)
+            stats_chart_url = generate_statistics_chart(
+                sections_dict, job_id, static_dir
+            )
             if stats_chart_url:
                 section_images.setdefault("statistics", []).append(stats_chart_url)
 
-            comp_chart_url = generate_comparison_chart(sections_dict, job_id, static_dir)
+            comp_chart_url = generate_comparison_chart(
+                sections_dict, job_id, static_dir
+            )
             if comp_chart_url:
                 section_images.setdefault("comparisons", []).append(comp_chart_url)
         except Exception as e:
             logger.warning("Section visual generation failed (non-fatal): %s", e)
 
-        # Prepare result
         completed_at = datetime.now().isoformat()
 
         result_data = {

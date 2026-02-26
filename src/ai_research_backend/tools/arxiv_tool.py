@@ -43,8 +43,10 @@ class ArxivSearchTool(BaseTool):
             os.makedirs(static_dir, exist_ok=True)
 
             for result in search.results():
+                arxiv_id = result.entry_id.split("/")[-1]
                 paper_info = {
                     "title": result.title,
+                    "arxiv_id": arxiv_id,
                     "authors": [a.name for a in result.authors],
                     "published": result.published.strftime("%Y-%m-%d"),
                     "summary": result.summary,
@@ -135,9 +137,6 @@ class ArxivSearchTool(BaseTool):
                 output_str += "-" * 50 + "\n"
 
             return output_str
-
-        except Exception as e:
-            return f"Error performing Arxiv search: {str(e)}"
 
         except Exception as e:
             return f"Error performing Arxiv search: {str(e)}"

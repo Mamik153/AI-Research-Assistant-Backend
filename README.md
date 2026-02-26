@@ -1,113 +1,199 @@
-# AiResearchBackend Crew
+# AI Research Assistant — Backend
 
-Welcome to the AiResearchBackend Crew project, powered by [crewAI](https://crewai.com). This template is designed to help you set up a multi-agent AI system with ease, leveraging the powerful and flexible framework provided by crewAI. Our goal is to enable your agents to collaborate effectively on complex tasks, maximizing their collective intelligence and capabilities.
+Backend service for the AI Research Assistant. Searches ArXiv for academic papers, builds a persistent knowledge base with semantic embeddings, and uses a multi-agent LLM pipeline to synthesise structured research reports.
+
+## Architecture
+
+```
+Request (topic)
+    │
+    ▼
+┌──────────────────────────────────┐
+│  FastAPI  (/api/research/dynamic)│
+└──────────┬───────────────────────┘
+           │
+    ┌──────▼──────┐   hit    ┌─────────────────────┐
+    │  ChromaDB   │─────────►│ Return cached context│
+    │ (persistent)│          └──────────┬───────────┘
+    └──────┬──────┘                     │
+           │ miss                       │
+    ┌──────▼──────┐                     │
+    │ ArXiv Search│                     │
+    │ + PDF Extract│                    │
+    └──────┬──────┘                     │
+           │ chunk + embed + dedup      │
+    ┌──────▼──────┐                     │
+    │  ChromaDB   │◄────────────────────┘
+    │  (updated)  │
+    └──────┬──────┘
+           │ top-K retrieval
+    ┌──────▼──────────────────────────────┐
+    │        Multi-Agent Pipeline         │
+    │                                     │
+    │  1. Paper Analyzer  (sub_llm)       │
+    │        ↓                            │
+    │  2a. Synthesis Agent (main_llm)  ─┐ │
+    │  2b. Diagram Agent   (sub_llm)   ─┤ │  ← parallel
+    │        ↓                          │ │
+    │     Merge results ◄───────────────┘ │
+    └──────┬──────────────────────────────┘
+           │
+    ┌──────▼──────┐
+    │  Post-proc  │  Mermaid formatting, section visuals,
+    │  + Visuals  │  math rendering, chart generation
+    └──────┬──────┘
+           │
+           ▼
+     JSON Response
+```
+
+### Research flow
+
+1. **Similarity search first** — The persistent ChromaDB vector store is queried before downloading anything. If enough relevant chunks already exist (>= 15 within distance threshold), the ArXiv step is skipped entirely.
+2. **ArXiv download + embed** — When new papers are needed, they are fetched from ArXiv, text/images extracted via PyMuPDF, cleaned, chunked (1500 chars / 300 overlap) with rich metadata, and stored persistently. Papers already in the store (matched by `arxiv_id`) are deduplicated.
+3. **Multi-agent pipeline** — Three specialised agents replace a single monolithic LLM call:
+   - **Paper Analyzer** (sub-model) extracts structured findings: key findings, methodologies, statistics, comparisons, timeline, applications, risks.
+   - **Synthesis Agent** (main model) writes the narrative summary and structured sections, receiving the analyzer output as pre-extracted data.
+   - **Diagram Agent** (sub-model) generates properly formatted Mermaid diagrams with strict syntax rules. Runs in parallel with the Synthesis Agent.
+4. **Post-processing** — Mermaid diagrams are reformatted (multi-line, quoted labels, validated). LaTeX expressions are rendered to PNG. Statistics and comparison charts are generated via matplotlib.
+
+### Key files
+
+| File | Purpose |
+|---|---|
+| `src/ai_research_backend/api.py` | FastAPI app, endpoints, Mermaid formatting, job orchestration |
+| `src/ai_research_backend/agents.py` | Multi-agent pipeline (Paper Analyzer, Synthesis, Diagram) |
+| `src/ai_research_backend/rag.py` | Persistent ChromaDB, chunking, similarity search, deduplication |
+| `src/ai_research_backend/crew.py` | LLM configuration (main + sub-agent), CrewAI crew definition |
+| `src/ai_research_backend/tools/arxiv_tool.py` | ArXiv search, PDF download, text/image extraction |
+| `src/ai_research_backend/section_visuals.py` | LaTeX rendering, statistics/comparison chart generation |
+| `src/ai_research_backend/models.py` | Pydantic models for API requests/responses |
+| `src/ai_research_backend/job_manager.py` | In-memory job status tracking, file-based result storage |
+| `src/ai_research_backend/config/agents.yaml` | CrewAI agent role/goal/backstory definitions |
+| `src/ai_research_backend/config/tasks.yaml` | CrewAI task descriptions |
 
 ## Installation
 
-Ensure you have Python >=3.10 <3.14 installed on your system. This project uses [UV](https://docs.astral.sh/uv/) for dependency management and package handling, offering a seamless setup and execution experience.
-
-First, if you haven't already, install uv:
+Requires Python >= 3.10, < 3.14. Uses [uv](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
 pip install uv
-```
-
-Next, navigate to your project directory and install the dependencies:
-
-```bash
 cd ai_research_backend
 uv sync
 ```
 
-### Customizing
+## Configuration
 
-**Add your API keys into the `.env` file**
+Copy `.env.example` to `.env` and fill in your keys:
 
-This project currently uses **Ollama Cloud** by default, but you can easily switch back to **Groq**.
-
-For Ollama Cloud, ensure you have:
 ```env
+# Main LLM (used by Synthesis Agent and CrewAI crew)
 OLLAMA_API_KEY=your_key_here
 OLLAMA_API_BASE=https://ollama.com/v1
 OLLAMA_MODEL=gpt-oss:120b-cloud
+
+# Sub-agent LLM (Paper Analyzer + Diagram Agent)
+# Leave OLLAMA_SUB_MODEL empty to use the main model for all agents
+OLLAMA_SUB_MODEL=llama3.2:3b
+OLLAMA_SUB_API_BASE=http://localhost:11434/v1
+OLLAMA_SUB_API_KEY=ollama
+
+# Base URL prepended to image paths in API responses
+API_BASE_URL=http://localhost:8000
 ```
 
-For Groq, ensure you have:
-```env
-GROQ_API_KEY=your_key_here
-```
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_API_KEY` | — | API key for the main Ollama Cloud model |
+| `OLLAMA_API_BASE` | `https://ollama.com/v1` | Base URL for the main model API |
+| `OLLAMA_MODEL` | `gpt-oss:120b-cloud` | Main model identifier (synthesis + CrewAI) |
+| `OLLAMA_SUB_MODEL` | *(empty = use main)* | Smaller model for Paper Analyzer and Diagram Agent |
+| `OLLAMA_SUB_API_BASE` | `http://localhost:11434/v1` | Base URL for the sub-agent model (e.g. local Ollama) |
+| `OLLAMA_SUB_API_KEY` | `ollama` | API key for the sub-agent model |
+| `API_BASE_URL` | `http://localhost:8000` | Absolute URL prefix for image paths in responses |
+| `TAVILY_API_KEY` | — | *(Optional)* Tavily web search API key |
 
-#### Comparing Groq vs Ollama
-To compare the outputs:
-1. Open `src/ai_research_backend/crew.py`.
-2. Uncomment the Groq LLM setup block.
-3. Change `active_llm = ollama_llm` to `active_llm = groq_llm`.
-4. Restart the server and run the same research topic to compare the generated `report.md` and structured data.
+### Using a local Ollama model for sub-agents
 
-- Modify `src/ai_research_backend/config/agents.yaml` to define your agents
-- Modify `src/ai_research_backend/config/tasks.yaml` to define your tasks
-- Modify `src/ai_research_backend/crew.py` to add your own logic, tools and specific args
-- Modify `src/ai_research_backend/main.py` to add custom inputs for your agents and tasks
-
-## Running the Project
-
-### Running the CrewAI Crew Directly
-
-To kickstart your crew of AI agents and begin task execution, run this from the root folder of your project:
+To run Paper Analyzer and Diagram Agent on a local Ollama instance:
 
 ```bash
-$ crewai run
+ollama pull llama3.2:3b
 ```
 
-This command initializes the ai-research-backend Crew, assembling the agents and assigning them tasks as defined in your configuration.
+Then set in `.env`:
 
-This example, unmodified, will run the create a `report.md` file with the output of a research on LLMs in the root folder.
+```env
+OLLAMA_SUB_MODEL=llama3.2:3b
+OLLAMA_SUB_API_BASE=http://localhost:11434/v1
+OLLAMA_SUB_API_KEY=ollama
+```
 
-### Running the FastAPI Server
+## Running the project
 
-To start the FastAPI server for the research API endpoints:
+### FastAPI server
 
 ```bash
 uv run uvicorn src.ai_research_backend.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Or using the script entry point:
+Or via script entry point:
 
 ```bash
 uv run run_api
 ```
 
-The API will be available at `http://localhost:8000` with the following endpoints:
+### CrewAI crew (standalone)
 
-- **POST** `/api/research` - Submit a research job with a topic
-- **GET** `/api/research/{job_id}` - Get the status of a research job
-- **GET** `/api/research/{job_id}/result` - Get the research result when completed
+```bash
+crewai run
+```
 
-The API supports CORS for frontend requests from `http://localhost:5173` and any subdomain of `slickspender.com`.
+## API endpoints
 
-#### Environment Variables
+### Dynamic research (multi-agent pipeline)
 
-| Variable | Default | Description |
+| Method | Path | Description |
 |---|---|---|
-| `API_BASE_URL` | `http://localhost:8000` | Base URL prepended to image paths so the frontend receives absolute URLs (e.g. `https://api.slickspender.com`). |
+| `POST` | `/api/research/dynamic` | Submit a dynamic research job |
+| `GET` | `/api/research/dynamic/{job_id}/result` | Get structured research result |
 
-#### Dynamic Research Result Extras
+The dynamic result includes: `summary`, `key_insights`, `generated_diagrams` (Mermaid), `structured_sections`, `section_confidence`, `section_images`, and `papers`.
 
-The `GET /api/research/dynamic/{job_id}/result` response includes:
+### CrewAI research (agent crew)
 
-- **`section_confidence`** — Confidence score (0–1) per structured section, indicating how well it is supported by the retrieved papers.
-- **`section_images`** — Per-section image URLs: extracted paper figures assigned by the LLM, rendered LaTeX equations, and auto-generated data charts for statistics and comparisons.
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/research` | Submit a CrewAI research job |
+| `GET` | `/api/research/{job_id}` | Get job status + progress |
+| `GET` | `/api/research/{job_id}/result` | Get markdown report + sources |
 
-## Understanding Your Crew
+### Other
 
-The ai-research-backend Crew is composed of multiple AI agents, each with unique roles, goals, and tools. These agents collaborate on a series of tasks, defined in `config/tasks.yaml`, leveraging their collective skills to achieve complex objectives. The `config/agents.yaml` file outlines the capabilities and configurations of each agent in your crew.
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Health check / root |
+| `GET` | `/static/...` | Extracted images, rendered math, generated charts |
 
-## Support
+CORS is configured for `http://localhost:5173` and `*.slickspender.com`.
 
-For support, questions, or feedback regarding the AiResearchBackend Crew or crewAI.
-- Visit our [documentation](https://docs.crewai.com)
-- Reach out to us through our [GitHub repository](https://github.com/joaomdmoura/crewai)
-- [Join our Discord](https://discord.com/invite/X4JWnZnxPb)
-- [Chat with our docs](https://chatg.pt/DWjSBZn)
+## Data storage
 
-Let's create wonders together with the power and simplicity of crewAI.
+| Path | Persisted | Description |
+|---|---|---|
+| `chroma_db/` | Yes | Persistent ChromaDB vector store (paper embeddings) |
+| `results/` | Yes (per job) | JSON result files, cleaned up after 1 hour |
+| `static/extracted_images/` | Yes (per job) | Images extracted from paper PDFs |
+| `static/generated_math/` | Yes (per job) | Rendered LaTeX equation PNGs |
+| `static/generated_charts/` | Yes (per job) | Matplotlib bar/comparison charts |
+
+## Chunking and embedding strategy
+
+Papers are split into two chunk types:
+
+- **Abstract chunks** — The paper abstract as a single high-signal chunk (`chunk_type: "abstract"`).
+- **Body chunks** — Full paper text cleaned (unicode normalised, citation brackets removed, email/URL stripped) then split at 1500 characters with 300-character overlap (`chunk_type: "body"`).
+
+Each chunk carries rich metadata: `title`, `authors`, `published`, `arxiv_id`, `pdf_url`, `chunk_type`, `chunk_position` (start/middle/end), `chunk_index`, `total_chunks`, and `topic_query`.
+
+Deduplication is by `arxiv_id` — if a paper is already in the vector store, its chunks are not re-added.

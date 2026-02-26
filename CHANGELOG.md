@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-02-26
+
+### Major change
+- Replaced single monolithic LLM call with a 3-agent pipeline: Paper Analyzer (extracts structured findings), Synthesis Agent (writes narrative + structured sections), and Diagram Agent (generates Mermaid diagrams). Synthesis and Diagram agents run in parallel for faster results.
+- Added persistent vector store (ChromaDB PersistentClient) with similarity-search-first logic. Repeated queries on the same topic now reuse existing embeddings instead of re-downloading papers from ArXiv.
+- Improved chunking strategy: larger chunks (1500 chars / 300 overlap), rich metadata (arxiv_id, chunk_type, chunk_position, pdf_url, topic_query), separate abstract embeddings, text cleaning, and deduplication by arxiv_id.
+
+### Fix
+- Fixed case-sensitivity bug in Mermaid diagram validation that silently rejected `sequenceDiagram`, `classDiagram`, `stateDiagram`, and `erDiagram` diagram types.
+- Added `_format_mermaid_diagram()` post-processor that converts semicolon-separated single-line diagrams to proper multi-line format and escapes special characters in node labels for reliable frontend parsing.
+- Updated LLM prompts to produce multi-line Mermaid syntax with explicit formatting rules and examples.
+
+### Minor change
+- Added configurable sub-agent LLM via `OLLAMA_SUB_MODEL`, `OLLAMA_SUB_API_BASE`, `OLLAMA_SUB_API_KEY` environment variables for running smaller Ollama models on analysis/diagram tasks.
+- Added `arxiv_id` field to paper data extracted from ArXiv for deduplication and tracking.
+- Fixed duplicate except block in ArXiv search tool.
+
 ## [0.2.0] - 2026-02-26
 
 ### Minor change
