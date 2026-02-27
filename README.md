@@ -87,6 +87,10 @@ uv sync
 Copy `.env.example` to `.env` and fill in your keys:
 
 ```env
+# Required: API key for all /api/research and /api/research/dynamic endpoints.
+# Send as header: Authorization: Bearer <key> or X-API-Key: <key>
+API_KEY=your_secret_key
+
 # Main LLM (used by Synthesis Agent and CrewAI crew)
 OLLAMA_API_KEY=your_key_here
 OLLAMA_API_BASE=https://ollama.com/v1
@@ -104,6 +108,9 @@ API_BASE_URL=http://localhost:8000
 
 | Variable | Default | Description |
 |---|---|---|
+| `API_KEY` | — | **Required.** Shared secret for research endpoints. Send as `Authorization: Bearer <key>` or `X-API-Key: <key>`. If unset, all research requests return 501. |
+| `MAX_CONCURRENT_RESEARCH_JOBS` | `1` | Max number of pending/running jobs. New submissions get 503 "Server busy" when at capacity. |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Max requests per minute per client (IP) on research endpoints. Exceeding returns 429. |
 | `OLLAMA_API_KEY` | — | API key for the main Ollama Cloud model |
 | `OLLAMA_API_BASE` | `https://ollama.com/v1` | Base URL for the main model API |
 | `OLLAMA_MODEL` | `gpt-oss:120b-cloud` | Main model identifier (synthesis + CrewAI) |
@@ -150,6 +157,8 @@ crewai run
 ```
 
 ## API endpoints
+
+All research endpoints require a valid API key: send `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>`. The root `GET /` is unauthenticated. Rate limiting applies per client (by IP); exceeding the limit returns `429 Too Many Requests`. If the server already has the maximum number of research jobs running or pending, new submissions receive `503 Service Unavailable` with `"code": "SERVER_BUSY"`.
 
 ### Dynamic research (multi-agent pipeline)
 

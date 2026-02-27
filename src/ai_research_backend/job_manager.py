@@ -39,6 +39,12 @@ def get_job_status(job_id: str) -> Optional[str]:
     return job_statuses.get(job_id)
 
 
+def count_ongoing_jobs() -> int:
+    """Return the number of jobs that are pending or running."""
+    ongoing = ("pending", "running")
+    return sum(1 for s in job_statuses.values() if s in ongoing)
+
+
 def save_result(job_id: str, result: dict):
     """Save job result to file system"""
     result_file = RESULTS_DIR / f"{job_id}.json"

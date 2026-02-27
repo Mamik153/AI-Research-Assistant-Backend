@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-02-27
+
+### Major change
+- Research endpoints (`POST /api/research`, `POST /api/research/dynamic`, and their GET status/result routes) now return **503 Service Unavailable** with `"code": "SERVER_BUSY"` when there are already ongoing (pending or running) research jobs at or above the configured limit. This prevents overload and gives clients a clear signal to retry later.
+
+### Minor change
+- **Rate limiting:** All research API endpoints are rate-limited per client (by IP). Default 10 requests per minute; configurable via `RATE_LIMIT_PER_MINUTE`. Exceeding returns **429 Too Many Requests** with `"code": "RATE_LIMIT_EXCEEDED"`.
+- **Simple authorization:** Research endpoints require a valid API key. Set `API_KEY` in the environment and send it as `Authorization: Bearer <key>` or `X-API-Key: <key>`. Missing or invalid key returns **401 Unauthorized**; if `API_KEY` is not set, the server returns **501 Not Implemented**. Root `GET /` remains unauthenticated.
+- **Config:** `MAX_CONCURRENT_RESEARCH_JOBS` (default 1) controls how many jobs can be pending or running before new submissions are rejected with 503.
+
 ## [0.3.0] - 2026-02-26
 
 ### Major change

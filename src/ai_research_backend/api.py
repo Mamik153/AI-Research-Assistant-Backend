@@ -3,12 +3,17 @@ import logging
 import re
 from datetime import datetime
 from typing import Dict, List, Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends, Header
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio
 import shutil
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from ai_research_backend.models import (
     ResearchRequest,
@@ -29,19 +34,72 @@ from ai_research_backend.job_manager import (
     update_job_progress,
     get_job_progress,
     add_intermediate_finding,
+    count_ongoing_jobs,
 )
 from ai_research_backend.crew import AiResearchBackend
 
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = (os.getenv("API_KEY") or "").strip()
+RATE_LIMIT_STRING = os.getenv("RATE_LIMIT_PER_MINUTE", "10") + "/minute"
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_RESEARCH_JOBS", "1"))
 
-SECTION_KEYS = frozenset({
-    "overview", "key_concepts", "benefits", "risks", "applications",
-    "future_directions", "methodologies", "comparisons", "timeline", "statistics",
-})
+SECTION_KEYS = frozenset(
+    {
+        "overview",
+        "key_concepts",
+        "benefits",
+        "risks",
+        "applications",
+        "future_directions",
+        "methodologies",
+        "comparisons",
+        "timeline",
+        "statistics",
+    }
+)
 
 app = FastAPI(title="AI Research Backend API", version="1.0.0")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+def _rate_limit_exceeded_handler_custom(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": "Too many requests. Try again later.",
+            "code": "RATE_LIMIT_EXCEEDED",
+        },
+    )
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler_custom)
+
+
+async def verify_api_key(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+) -> None:
+    """Require a valid API key via Authorization: Bearer <key> or X-API-Key: <key>."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    if not API_KEY:
+        raise HTTPException(
+            status_code=501,
+            detail="API key not configured. Set API_KEY environment variable.",
+        )
+    if not token or token != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
+
 
 # Configure CORS
 app.add_middleware(
@@ -58,13 +116,14 @@ static_dir = os.path.join(os.getcwd(), "static")
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+
 async def delayed_cleanup(delay_seconds: int = 3600):
     """
     Wait for the specified delay, then delete all files in the results and static/extracted_images directories.
     """
     await asyncio.sleep(delay_seconds)
     logger.info("Starting delayed cleanup of results and extracted images...")
-    
+
     # Paths to clean
     results_dir = os.path.join(os.getcwd(), "results")
     dirs_to_clean = [
@@ -72,7 +131,7 @@ async def delayed_cleanup(delay_seconds: int = 3600):
         os.path.join(os.getcwd(), "static", "generated_math"),
         os.path.join(os.getcwd(), "static", "generated_charts"),
     ]
-    
+
     # Clean results directory
     if os.path.exists(results_dir):
         for filename in os.listdir(results_dir):
@@ -84,7 +143,7 @@ async def delayed_cleanup(delay_seconds: int = 3600):
                     shutil.rmtree(file_path)
             except Exception as e:
                 logger.error(f"Failed to delete {file_path}. Reason: {e}")
-                
+
     # Clean static image directories
     for dir_path in dirs_to_clean:
         if os.path.exists(dir_path):
@@ -97,7 +156,7 @@ async def delayed_cleanup(delay_seconds: int = 3600):
                         shutil.rmtree(file_path)
                 except Exception as e:
                     logger.error(f"Failed to delete {file_path}. Reason: {e}")
-                
+
     logger.info("Delayed cleanup completed.")
 
 
@@ -129,7 +188,8 @@ def _normalize_section_confidence(raw: Optional[dict]) -> Optional[Dict[str, flo
 
 
 def _normalize_section_images(
-    raw: Optional[dict], allowed_urls: set[str],
+    raw: Optional[dict],
+    allowed_urls: set[str],
 ) -> Optional[Dict[str, List[str]]]:
     """Normalize section_images: keep only known section keys and allowed image URLs."""
     if not raw or not isinstance(raw, dict):
@@ -172,7 +232,10 @@ def _unwrap_llm_response(llm_data: Optional[dict]) -> dict:
         if not isinstance(parsed, dict):
             return llm_data
         # Prefer unwrapped if it has the expected structure
-        if any(k in parsed for k in ("key_insights", "structured_sections", "generated_diagrams")):
+        if any(
+            k in parsed
+            for k in ("key_insights", "structured_sections", "generated_diagrams")
+        ):
             return parsed
     except (json.JSONDecodeError, TypeError):
         pass
@@ -215,7 +278,8 @@ def _extract_inner_json_from_response(raw: str) -> Optional[dict]:
                     try:
                         candidate = json.loads(raw[start : i + 1])
                         if isinstance(candidate, dict) and any(
-                            k in candidate for k in ("summary", "key_insights", "structured_sections")
+                            k in candidate
+                            for k in ("summary", "key_insights", "structured_sections")
                         ):
                             return _unwrap_llm_response(candidate)
                     except (json.JSONDecodeError, TypeError):
@@ -325,7 +389,9 @@ def _format_mermaid_diagram(diagram: str) -> str:
             continue
         if i == 0:
             first_token = line.split()[0].lower()
-            is_declaration = any(first_token.startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES)
+            is_declaration = any(
+                first_token.startswith(p) for p in _MERMAID_DIAGRAM_PREFIXES
+            )
             if is_declaration:
                 output_lines.append(line)
                 continue
@@ -338,9 +404,9 @@ def _format_mermaid_diagram(diagram: str) -> str:
                 label = '"' + label.replace('"', "'") + '"'
             return bracket_open + label + bracket_close
 
-        line = re.sub(r'(\[)([^\]]+)(\])', _quote_label, line)
-        line = re.sub(r'(\(\()([^)]+)(\)\))', _quote_label, line)
-        line = re.sub(r'(\{)([^}]+)(\})', _quote_label, line)
+        line = re.sub(r"(\[)([^\]]+)(\])", _quote_label, line)
+        line = re.sub(r"(\(\()([^)]+)(\)\))", _quote_label, line)
+        line = re.sub(r"(\{)([^}]+)(\})", _quote_label, line)
 
         if line:
             output_lines.append("    " + line)
@@ -389,9 +455,7 @@ def _parse_llm_response(response: str) -> dict:
     """Parse LLM response string into llm_data dict (with unwrap, repair, fallbacks)."""
     llm_data = None
     try:
-        code_block_match = re.search(
-            r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", response
-        )
+        code_block_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", response)
         if code_block_match:
             try:
                 llm_data = json.loads(code_block_match.group(1))
@@ -585,18 +649,37 @@ def run_research_job(job_id: str, topic: str):
 
 
 @app.post("/api/research", response_model=JobStatusResponse)
-async def submit_research(request: ResearchRequest, background_tasks: BackgroundTasks):
+@limiter.limit(RATE_LIMIT_STRING)
+async def submit_research(
+    request: Request,
+    body: ResearchRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_api_key),
+):
     """Submit a new research job"""
-    job_id = create_job(request.topic)
+    if count_ongoing_jobs() >= MAX_CONCURRENT_JOBS:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Server busy. Try again later.",
+                "code": "SERVER_BUSY",
+            },
+        )
+    job_id = create_job(body.topic)
 
     # Start background task
-    background_tasks.add_task(run_research_job, job_id, request.topic)
+    background_tasks.add_task(run_research_job, job_id, body.topic)
 
-    return JobStatusResponse(job_id=job_id, status="pending", topic=request.topic)
+    return JobStatusResponse(job_id=job_id, status="pending", topic=body.topic)
 
 
 @app.get("/api/research/{job_id}", response_model=JobStatusResponse)
-async def get_research_status(job_id: str):
+@limiter.limit(RATE_LIMIT_STRING)
+async def get_research_status(
+    request: Request,
+    job_id: str,
+    _: None = Depends(verify_api_key),
+):
     """Get the status of a research job"""
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -630,7 +713,12 @@ async def get_research_status(job_id: str):
 
 
 @app.get("/api/research/{job_id}/result", response_model=ResearchResultResponse)
-async def get_research_result(job_id: str):
+@limiter.limit(RATE_LIMIT_STRING)
+async def get_research_result(
+    request: Request,
+    job_id: str,
+    _: None = Depends(verify_api_key),
+):
     """Get the result of a completed research job"""
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -787,7 +875,9 @@ Available Images (use ONLY these URLs in section_images):
 
         valid, reason = _validate_llm_response(llm_data)
         if not valid:
-            logger.warning("Agent pipeline output validation failed: %s — using raw output", reason)
+            logger.warning(
+                "Agent pipeline output validation failed: %s — using raw output", reason
+            )
 
         # ---- Step 4: Post-process results ----
         structured_sections = _parse_structured_sections(
@@ -883,23 +973,41 @@ Available Images (use ONLY these URLs in section_images):
 
 
 @app.post("/api/research/dynamic", response_model=JobStatusResponse)
+@limiter.limit(RATE_LIMIT_STRING)
 async def submit_dynamic_research(
-    request: ResearchRequest, background_tasks: BackgroundTasks
+    request: Request,
+    body: ResearchRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_api_key),
 ):
     """Submit a new dynamic research job"""
-    job_id = create_job(request.topic)
+    if count_ongoing_jobs() >= MAX_CONCURRENT_JOBS:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Server busy. Try again later.",
+                "code": "SERVER_BUSY",
+            },
+        )
+    job_id = create_job(body.topic)
 
     # Start background task
-    background_tasks.add_task(run_dynamic_research_job, job_id, request.topic)
+    background_tasks.add_task(run_dynamic_research_job, job_id, body.topic)
 
-    return JobStatusResponse(job_id=job_id, status="pending", topic=request.topic)
+    return JobStatusResponse(job_id=job_id, status="pending", topic=body.topic)
 
 
 @app.get(
     "/api/research/dynamic/{job_id}/result",
     response_model=DynamicResearchResultResponse,
 )
-async def get_dynamic_research_result(job_id: str, background_tasks: BackgroundTasks):
+@limiter.limit(RATE_LIMIT_STRING)
+async def get_dynamic_research_result(
+    request: Request,
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_api_key),
+):
     """Get the result of a completed dynamic research job"""
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
