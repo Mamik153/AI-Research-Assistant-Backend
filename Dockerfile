@@ -14,6 +14,12 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
+# Pre-download the sentence-transformers embedding model so it is baked into
+# the image layer instead of downloaded at runtime (saves ~90 MB bandwidth and
+# avoids memory spikes from concurrent download + model load).
+ENV PATH="/app/.venv/bin:$PATH"
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 RUN useradd --create-home --no-log-init appuser \
     && chown -R appuser:appuser /app
 

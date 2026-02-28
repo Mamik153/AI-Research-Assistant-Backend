@@ -40,15 +40,6 @@ To make your backend accessible to your frontend:
 3. Click **Generate Domain** (or add a custom domain). 
 4. This will give you a URL like `ai-research-backend-production.up.railway.app`. Use this URL as the `API_BASE_URL` in your frontend.
 
-### 4. (Optional) Configure Persistent Storage for ChromaDB
-
-By default, Railway containers are stateless. If your container restarts, local files (like the ChromaDB vector store) will be lost. For a demo, this is fine. If you want to keep your vector database across deployments:
-
-1. Go to the **Volumes** tab in your service.
-2. Click **Create Volume**.
-3. Set the Mount Path to `/app/chroma_db` (since our Dockerfile uses `/app` as the working directory).
-4. Job results and static assets (images, PDFs) are stored in Supabase Storage when configured; no volumes are needed for `/app/results` or `/app/static`.
-
-### 5. CORS Configuration
+### 4. CORS Configuration
 
 Ensure that your frontend's domain is allowed in the backend's CORS settings. If your frontend is deployed to a new domain (like Vercel or Netlify), you may need to update the CORS configuration in `src/ai_research_backend/api.py` and push the changes to GitHub. Railway will automatically rebuild and redeploy your service.

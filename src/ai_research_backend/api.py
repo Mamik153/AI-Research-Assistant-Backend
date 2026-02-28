@@ -52,9 +52,9 @@ logger = logging.getLogger(__name__)
 # prevent the rest from loading.
 # ---------------------------------------------------------------------------
 try:
-    from ai_research_backend.crew import active_llm, sub_llm
+    from ai_research_backend.llm_config import active_llm, sub_llm
 except Exception:
-    logger.warning("Could not import crew module — LLMs will be unavailable", exc_info=True)
+    logger.warning("Could not import llm_config module — LLMs will be unavailable", exc_info=True)
     active_llm = None  # type: ignore[assignment]
     sub_llm = None  # type: ignore[assignment]
 

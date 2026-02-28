@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-02-28
+
+### Fix
+- **Container OOM kill during research jobs:** The `crewai` package pulls in `chromadb` and `onnxruntime` as core transitive dependencies. ChromaDB's default embedding function downloads and loads a ~79 MB ONNX model at runtime, causing the container to exceed its memory limit and get killed. Decoupled the dynamic research path from crewai by introducing `llm_config.py`, a lightweight LLM wrapper using `litellm` directly. The module-level import in `api.py` no longer triggers the crewai -> chromadb -> onnxruntime import chain, saving ~200-400 MB of peak memory.
+
+### Minor change
+- Pre-download the `all-MiniLM-L6-v2` sentence-transformers embedding model at Docker build time so it is baked into the image layer instead of downloaded on first request.
+- Removed legacy `chroma_db/` directory and outdated ChromaDB volume instructions from Railway deployment docs (ChromaDB was replaced by Supabase pgvector in v0.6.0).
+
 ## [0.6.1] - 2026-02-28
 
 ### Fix
