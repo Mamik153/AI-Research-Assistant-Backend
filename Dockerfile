@@ -1,24 +1,22 @@
-# Use Python 3.12 slim for smaller image
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Copy dependency files first (better layer caching)
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies (no dev) into system Python
-ENV UV_SYSTEM_PYTHON=1
+# Install dependencies only — project itself is deferred for caching
 RUN uv sync --frozen --no-dev --no-install-project
 
-# Copy application code
+# Copy application code, then install the project (deps already cached)
 COPY src ./src
+RUN uv sync --frozen --no-dev
 
-# Cloud Run sets PORT (default 8080)
+# Put venv binaries (python, uvicorn, etc.) on PATH
+ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080
 EXPOSE 8080
 
-# Run with PORT so Cloud Run works; use 0.0.0.0 for Cloud Run
-CMD python -m uvicorn src.ai_research_backend.api:app --host 0.0.0.0 --port ${PORT}
+CMD uvicorn ai_research_backend.api:app --host 0.0.0.0 --port ${PORT}
