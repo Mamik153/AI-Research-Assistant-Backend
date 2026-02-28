@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] - 2026-02-28
+
+### Fix
+- **Railway build timeout:** The Docker image was ~4-5 GB because `sentence-transformers` pulled in full CUDA-enabled PyTorch (~915 MB wheel + ~1.5 GB of NVIDIA runtime libraries) on Linux, even though Railway has no GPUs. Configured uv to resolve `torch` from the PyTorch CPU-only index, reducing the torch wheel to ~200 MB and eliminating all NVIDIA/CUDA transitive dependencies (40 fewer packages).
+- **Slow `chown -R` during Docker build:** The `useradd` + `chown -R /app` step took ~36 s because it recursively re-owned the entire multi-GB `.venv`. Restructured the Dockerfile to create the user first and use `COPY --chown` so all files are owned correctly from the start, eliminating the recursive chown entirely.
+
+### Minor change
+- Added `--no-cache` to `uv sync` in the Dockerfile to prevent download caches from inflating image layers.
+- Pinned the uv Docker image tag to `0.9` instead of `latest` for reproducible builds.
+- Added `torch` as an explicit direct dependency to enable uv source index overrides.
+
 ## [0.6.2] - 2026-02-28
 
 ### Fix

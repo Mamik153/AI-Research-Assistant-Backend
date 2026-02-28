@@ -1,32 +1,24 @@
 FROM python:3.12-slim
 
+RUN useradd --create-home --no-log-init appuser
+
 WORKDIR /app
+RUN chown appuser:appuser /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
 
-# Copy dependency files first (better layer caching)
-COPY pyproject.toml uv.lock ./
-
-# Install dependencies only — project itself is deferred for caching
-RUN uv sync --frozen --no-dev --no-install-project
-
-# Copy application code, then install the project (deps already cached)
-COPY src ./src
-RUN uv sync --frozen --no-dev
-
-# Pre-download the sentence-transformers embedding model so it is baked into
-# the image layer instead of downloaded at runtime (saves ~90 MB bandwidth and
-# avoids memory spikes from concurrent download + model load).
-ENV PATH="/app/.venv/bin:$PATH"
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-
-RUN useradd --create-home --no-log-init appuser \
-    && chown -R appuser:appuser /app
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
 
 USER appuser
 
-# Put venv binaries (python, uvicorn, etc.) on PATH
+RUN uv sync --frozen --no-dev --no-install-project --no-cache
+
+COPY --chown=appuser:appuser src ./src
+RUN uv sync --frozen --no-dev --no-cache
+
 ENV PATH="/app/.venv/bin:$PATH"
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 ENV PORT=8080
 EXPOSE 8080
 
