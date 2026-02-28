@@ -21,4 +21,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Run with PORT so Cloud Run works; use 0.0.0.0 for Cloud Run
-CMD uvicorn src.ai_research_backend.api:app --host 0.0.0.0 --port ${PORT}
+CMD python -m uvicorn src.ai_research_backend.api:app --host 0.0.0.0 --port ${PORT}
