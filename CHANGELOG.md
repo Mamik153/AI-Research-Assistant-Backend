@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-02-28
+
+### Fix
+- Relaxed Content-Security-Policy for `/docs` and `/redoc` so Swagger UI and ReDoc can load CDN assets (cdn.jsdelivr.net) and inline scripts; all other routes keep strict `default-src 'self'`.
+
 ## [0.5.0] - 2026-02-28
 
 ### BREAKING CHANGE

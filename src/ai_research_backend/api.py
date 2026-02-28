@@ -67,6 +67,18 @@ MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    # Paths that serve Swagger UI / ReDoc and need relaxed CSP for CDN + inline scripts
+    _DOCS_PATHS = frozenset({"/docs", "/docs/", "/redoc", "/redoc/", "/openapi.json"})
+
+    # CSP that allows Swagger UI assets: cdn.jsdelivr.net, fastapi favicon, inline script/style
+    _CSP_DOCS = (
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+        "style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+        "img-src 'self' https://fastapi.tiangolo.com https://cdn.jsdelivr.net"
+    )
+    _CSP_DEFAULT = "default-src 'self'"
+
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -75,7 +87,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Strict-Transport-Security"] = (
             "max-age=31536000; includeSubDomains"
         )
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        csp = (
+            self._CSP_DOCS
+            if request.url.path in self._DOCS_PATHS
+            else self._CSP_DEFAULT
+        )
+        response.headers["Content-Security-Policy"] = csp
         response.headers["Permissions-Policy"] = (
             "camera=(), microphone=(), geolocation=()"
         )
