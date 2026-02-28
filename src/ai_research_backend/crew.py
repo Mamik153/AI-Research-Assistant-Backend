@@ -66,11 +66,11 @@ ollama_llm = LLM(
 )
 
 # --- Sub-agent LLM (smaller model for analysis / diagram generation) ---
-_sub_model = os.getenv("OLLAMA_SUB_MODEL", "")
+_sub_model = os.getenv("OLLAMA_SUB_MODEL", "ministral-3:3b")
 if _sub_model:
     sub_llm = LLM(
         model=f"openai/{_sub_model}",
-        base_url=os.getenv("OLLAMA_SUB_API_BASE", "http://localhost:11434/v1"),
+        base_url=os.getenv("OLLAMA_SUB_API_BASE", "https://ollama.com/v1"),
         api_key=os.getenv("OLLAMA_SUB_API_KEY", "ollama"),
         temperature=0.5,
         max_tokens=4096,

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-02-28
+
+### BREAKING CHANGE
+- Static files at `/static/` now require API key authentication. Clients must include `Authorization: Bearer <key>` or `X-API-Key: <key>` when fetching images and charts.
+- CORS production regex now only allows HTTPS origins on `slickspender.com` (previously allowed HTTP). Allowed methods restricted to GET, POST, OPTIONS; allowed headers restricted to Authorization, X-API-Key, Content-Type.
+- The `API_KEY not configured` response no longer returns HTTP 501; it now returns 401 (same as invalid key) to prevent configuration state disclosure.
+
+### Major change
+- **Security hardening:** Addressed 22 identified vulnerabilities across critical, high, medium, and low severity levels.
+- API key comparison now uses constant-time `hmac.compare_digest()` to prevent timing side-channel attacks (CVE-2026-23996 pattern).
+- Added `SecurityHeadersMiddleware` injecting X-Content-Type-Options, X-Frame-Options, Strict-Transport-Security, Content-Security-Policy, Referrer-Policy, and Permissions-Policy on all responses.
+- Added `RequestSizeLimitMiddleware` rejecting request bodies larger than 1 MB (HTTP 413).
+- All `job_id` path parameters are now validated as proper UUIDs before file-system access, preventing path traversal.
+- Error messages returned to clients are now generic; detailed exception info is logged server-side only.
+- Research topic input now enforces 3-500 character length and strips control characters to mitigate prompt injection.
+- Dockerfile now runs as non-root `appuser` instead of root.
+- In-memory job store now has TTL-based eviction (2 hours for terminal jobs, 500 job cap) to prevent unbounded memory growth.
+- Minimum PyMuPDF version bumped to >=1.27.1 to address VU#504749 (path traversal) and CVE-2025-55780 (NULL pointer DoS).
+
 ## [0.4.0] - 2026-02-27
 
 ### Major change

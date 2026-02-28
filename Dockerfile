@@ -14,6 +14,11 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
+RUN useradd --create-home --no-log-init appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
 # Put venv binaries (python, uvicorn, etc.) on PATH
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080

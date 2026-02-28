@@ -1,30 +1,74 @@
 import json
+import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
 import uuid
 
-# Directory for storing job results
-# Use absolute path relative to the project root (ai_research_backend directory)
+logger = logging.getLogger(__name__)
+
 RESULTS_DIR = Path(__file__).parent.parent.parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
+
+JOB_TTL_SECONDS = 7200  # 2 hours
+MAX_STORED_JOBS = 500
 
 # In-memory job status tracking
 job_statuses: Dict[str, str] = {}
 job_topics: Dict[str, str] = {}
+job_created_at: Dict[str, float] = {}
 
 # Chain of thought tracking
-job_progress: Dict[str, dict] = {}  # Stores current_step, progress_percentage
-job_thoughts: Dict[str, list] = {}  # Stores chain of thought messages
-job_findings: Dict[str, list] = {}  # Stores intermediate findings
+job_progress: Dict[str, dict] = {}
+job_thoughts: Dict[str, list] = {}
+job_findings: Dict[str, list] = {}
+
+_eviction_lock = threading.Lock()
+
+
+def _evict_expired_jobs() -> None:
+    """Remove completed/failed jobs older than JOB_TTL_SECONDS."""
+    now = time.monotonic()
+    terminal = ("completed", "failed")
+    to_remove = [
+        jid
+        for jid, created in job_created_at.items()
+        if (now - created) > JOB_TTL_SECONDS and job_statuses.get(jid) in terminal
+    ]
+    if not to_remove and len(job_statuses) > MAX_STORED_JOBS:
+        sorted_jobs = sorted(
+            (
+                (jid, ts)
+                for jid, ts in job_created_at.items()
+                if job_statuses.get(jid) in terminal
+            ),
+            key=lambda x: x[1],
+        )
+        excess = len(job_statuses) - MAX_STORED_JOBS
+        to_remove = [jid for jid, _ in sorted_jobs[:excess]]
+
+    for jid in to_remove:
+        job_statuses.pop(jid, None)
+        job_topics.pop(jid, None)
+        job_created_at.pop(jid, None)
+        job_progress.pop(jid, None)
+        job_thoughts.pop(jid, None)
+        job_findings.pop(jid, None)
+    if to_remove:
+        logger.info("Evicted %d expired jobs from memory", len(to_remove))
 
 
 def create_job(topic: str) -> str:
     """Create a new job and return its ID"""
+    with _eviction_lock:
+        _evict_expired_jobs()
     job_id = str(uuid.uuid4())
     job_statuses[job_id] = "pending"
     job_topics[job_id] = topic
+    job_created_at[job_id] = time.monotonic()
     return job_id
 
 

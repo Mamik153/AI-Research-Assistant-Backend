@@ -1,12 +1,15 @@
+import hmac
 import json
 import logging
 import re
+import uuid as uuid_mod
 from datetime import datetime
 from typing import Dict, List, Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends, Header
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 import os
 import asyncio
 import shutil
@@ -60,7 +63,46 @@ SECTION_KEYS = frozenset(
     }
 )
 
+MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=()"
+        )
+        return response
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds a configured limit."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_REQUEST_BODY_BYTES):
+        super().__init__(app)
+        self.max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > self.max_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large."},
+            )
+        return await call_next(request)
+
+
 app = FastAPI(title="AI Research Backend API", version="1.0.0")
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -89,32 +131,49 @@ async def verify_api_key(
         token = authorization[7:].strip()
     elif x_api_key:
         token = x_api_key.strip()
-    if not API_KEY:
-        raise HTTPException(
-            status_code=501,
-            detail="API key not configured. Set API_KEY environment variable.",
-        )
-    if not token or token != API_KEY:
+    if not API_KEY or not token or not hmac.compare_digest(token, API_KEY):
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing API key",
         )
 
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_origin_regex=r"^https?://([a-z0-9-]+\.)*slickspender\.com(:\d+)?$",
+    allow_origin_regex=r"^https://([a-z0-9-]+\.)*slickspender\.com$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "X-API-Key", "Content-Type"],
 )
 
-# Mount static directory for serving images
 static_dir = os.path.join(os.getcwd(), "static")
 os.makedirs(static_dir, exist_ok=True)
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+@app.get("/static/{file_path:path}")
+async def serve_static(
+    file_path: str,
+    _: None = Depends(verify_api_key),
+):
+    """Serve static files with API key authentication."""
+    safe_path = os.path.normpath(file_path)
+    if safe_path.startswith("..") or os.path.isabs(safe_path):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    full_path = os.path.join(static_dir, safe_path)
+    if not full_path.startswith(os.path.realpath(static_dir)):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(full_path)
+
+
+def _validate_job_id(job_id: str) -> None:
+    """Validate that job_id is a proper UUID to prevent path traversal."""
+    try:
+        uuid_mod.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format")
 
 
 async def delayed_cleanup(delay_seconds: int = 3600):
@@ -633,8 +692,7 @@ def run_research_job(job_id: str, topic: str):
         update_job_status(job_id, "completed")
 
     except Exception as e:
-        # Handle errors
-        error_message = str(e)
+        logger.exception("Research job %s failed", job_id)
         completed_at = datetime.now().isoformat()
         result_data = {
             "report": "",
@@ -642,7 +700,7 @@ def run_research_job(job_id: str, topic: str):
             "completed_at": completed_at,
             "jobId": job_id,
             "topic": topic,
-            "error": error_message,
+            "error": "An internal error occurred while processing the research job.",
         }
         save_result(job_id, result_data)
         update_job_status(job_id, "failed")
@@ -681,6 +739,7 @@ async def get_research_status(
     _: None = Depends(verify_api_key),
 ):
     """Get the status of a research job"""
+    _validate_job_id(job_id)
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -720,6 +779,7 @@ async def get_research_result(
     _: None = Depends(verify_api_key),
 ):
     """Get the result of a completed research job"""
+    _validate_job_id(job_id)
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -736,8 +796,10 @@ async def get_research_result(
         raise HTTPException(status_code=404, detail="Result not found")
 
     if status == "failed":
-        error_msg = result.get("error", "Unknown error occurred")
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(
+            status_code=500,
+            detail="Research job failed. Please try again later.",
+        )
 
     return ResearchResultResponse(
         report=result.get("report", ""),
@@ -960,10 +1022,10 @@ Available Images (use ONLY these URLs in section_images):
         update_job_status(job_id, "completed")
 
     except Exception as e:
-        error_message = str(e)
+        logger.exception("Dynamic research job %s failed", job_id)
         completed_at = datetime.now().isoformat()
         result_data = {
-            "error": error_message,
+            "error": "An internal error occurred while processing the research job.",
             "completed_at": completed_at,
             "jobId": job_id,
             "topic": topic,
@@ -1009,6 +1071,7 @@ async def get_dynamic_research_result(
     _: None = Depends(verify_api_key),
 ):
     """Get the result of a completed dynamic research job"""
+    _validate_job_id(job_id)
     if not job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1025,8 +1088,10 @@ async def get_dynamic_research_result(
         raise HTTPException(status_code=404, detail="Result not found")
 
     if status == "failed":
-        error_msg = result.get("error", "Unknown error occurred")
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(
+            status_code=500,
+            detail="Research job failed. Please try again later.",
+        )
 
     # Build structured_sections from stored dict (backward compatible: missing => empty)
     raw_sections = result.get("structured_sections")

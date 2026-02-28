@@ -1,6 +1,10 @@
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Optional, List
 from datetime import datetime
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 # --- Structured sections for UI-friendly dynamic research ---
@@ -146,7 +150,20 @@ class StructuredSections(BaseModel):
 class ResearchRequest(BaseModel):
     """Request model for research job submission"""
 
-    topic: str = Field(..., description="Research topic to investigate")
+    topic: str = Field(
+        ...,
+        description="Research topic to investigate",
+        min_length=3,
+        max_length=500,
+    )
+
+    @field_validator("topic")
+    @classmethod
+    def sanitize_topic(cls, v: str) -> str:
+        v = _CONTROL_CHAR_RE.sub("", v).strip()
+        if len(v) < 3:
+            raise ValueError("Topic must be at least 3 characters after sanitization")
+        return v
 
 
 class JobStatusResponse(BaseModel):
