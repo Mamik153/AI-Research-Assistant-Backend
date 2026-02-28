@@ -1,14 +1,18 @@
-"""Generate section-level visual assets: rendered math equations and data charts."""
+"""Generate section-level visual assets: rendered math equations and data charts.
 
+All images are rendered in-memory and uploaded to Supabase Storage.
+"""
+
+import io
 import logging
-import os
 import re
 from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import mathtext
+
+from ai_research_backend.storage import upload_file
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +26,8 @@ MATH_PATTERN = re.compile(
 )
 
 
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _render_latex_to_png(latex: str, output_path: str, dpi: int = 150) -> bool:
-    """Render a LaTeX math string to a PNG file. Returns True on success."""
+def _render_latex_to_bytes(latex: str, dpi: int = 150) -> Optional[bytes]:
+    """Render a LaTeX math string to PNG bytes. Returns None on failure."""
     try:
         fig, ax = plt.subplots(figsize=(6, 1.2))
         ax.axis("off")
@@ -36,28 +36,25 @@ def _render_latex_to_png(latex: str, output_path: str, dpi: int = 150) -> bool:
             fontsize=18, ha="center", va="center",
             transform=ax.transAxes,
         )
-        fig.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0.1, transparent=True)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1, transparent=True)
         plt.close(fig)
-        return True
+        buf.seek(0)
+        return buf.read()
     except Exception as e:
         logger.debug("Failed to render LaTeX '%s': %s", latex[:60], e)
         plt.close("all")
-        return False
+        return None
 
 
 def render_section_math(
     structured_sections: dict,
     job_id: str,
-    static_root: str,
 ) -> Dict[str, List[str]]:
-    """Scan section text for LaTeX math, render each to a PNG.
+    """Scan section text for LaTeX math, render each to PNG and upload.
 
-    Returns a dict mapping section keys to lists of relative image URLs
-    (e.g. "/static/generated_math/jobid_overview_0.png").
+    Returns a dict mapping section keys to lists of public image URLs.
     """
-    output_dir = os.path.join(static_root, "generated_math")
-    _ensure_dir(output_dir)
-
     result: Dict[str, List[str]] = {}
 
     text_fields = {
@@ -103,10 +100,15 @@ def render_section_math(
             latex = next((g for g in groups if g), None)
             if not latex or len(latex.strip()) < 2:
                 continue
-            filename = f"{job_id}_{section_key}_{idx}.png"
-            filepath = os.path.join(output_dir, filename)
-            if _render_latex_to_png(latex, filepath):
-                urls.append(f"/static/generated_math/{filename}")
+            png_bytes = _render_latex_to_bytes(latex)
+            if png_bytes is None:
+                continue
+            storage_path = f"generated_math/{job_id}_{section_key}_{idx}.png"
+            try:
+                url = upload_file(storage_path, png_bytes, "image/png")
+                urls.append(url)
+            except Exception as exc:
+                logger.warning("Math image upload failed: %s", exc)
         if urls:
             result[section_key] = urls
 
@@ -116,11 +118,10 @@ def render_section_math(
 def generate_statistics_chart(
     structured_sections: dict,
     job_id: str,
-    static_root: str,
 ) -> Optional[str]:
     """Generate a bar chart from the statistics section data.
 
-    Returns a relative image URL or None if no chart could be generated.
+    Returns a public image URL or None if no chart could be generated.
     """
     stats = structured_sections.get("statistics")
     if not stats or not isinstance(stats, list) or len(stats) < 2:
@@ -144,11 +145,8 @@ def generate_statistics_chart(
         return None
 
     try:
-        output_dir = os.path.join(static_root, "generated_charts")
-        _ensure_dir(output_dir)
-
         fig, ax = plt.subplots(figsize=(max(6, len(values) * 1.2), 4))
-        bars = ax.bar(range(len(values)), values, color="#4A90D9", edgecolor="white")
+        ax.bar(range(len(values)), values, color="#4A90D9", edgecolor="white")
         ax.set_xticks(range(len(values)))
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
         ax.set_ylabel("Value")
@@ -156,11 +154,13 @@ def generate_statistics_chart(
         ax.spines["right"].set_visible(False)
         fig.tight_layout()
 
-        filename = f"{job_id}_statistics.png"
-        filepath = os.path.join(output_dir, filename)
-        fig.savefig(filepath, dpi=120, bbox_inches="tight")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
         plt.close(fig)
-        return f"/static/generated_charts/{filename}"
+        buf.seek(0)
+
+        storage_path = f"generated_charts/{job_id}_statistics.png"
+        return upload_file(storage_path, buf.read(), "image/png")
     except Exception as e:
         logger.debug("Failed to generate statistics chart: %s", e)
         plt.close("all")
@@ -170,11 +170,10 @@ def generate_statistics_chart(
 def generate_comparison_chart(
     structured_sections: dict,
     job_id: str,
-    static_root: str,
 ) -> Optional[str]:
     """Generate a grouped bar chart from the comparisons section.
 
-    Returns a relative image URL or None if not possible.
+    Returns a public image URL or None if not possible.
     """
     comp = structured_sections.get("comparisons")
     if not comp or not isinstance(comp, dict):
@@ -204,8 +203,6 @@ def generate_comparison_chart(
 
     try:
         import numpy as np
-        output_dir = os.path.join(static_root, "generated_charts")
-        _ensure_dir(output_dir)
 
         n_criteria = len(criteria)
         n_items = len(numeric_items)
@@ -227,11 +224,13 @@ def generate_comparison_chart(
         ax.spines["right"].set_visible(False)
         fig.tight_layout()
 
-        filename = f"{job_id}_comparisons.png"
-        filepath = os.path.join(output_dir, filename)
-        fig.savefig(filepath, dpi=120, bbox_inches="tight")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
         plt.close(fig)
-        return f"/static/generated_charts/{filename}"
+        buf.seek(0)
+
+        storage_path = f"generated_charts/{job_id}_comparisons.png"
+        return upload_file(storage_path, buf.read(), "image/png")
     except Exception as e:
         logger.debug("Failed to generate comparison chart: %s", e)
         plt.close("all")

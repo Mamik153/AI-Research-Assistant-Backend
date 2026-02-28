@@ -1,11 +1,26 @@
-from crewai.tools import BaseTool
+import logging
 from typing import Type, List
-from pydantic import BaseModel, Field
+
 import arxiv
 import fitz  # pymupdf
 import os
-import requests
-from datetime import datetime
+import tempfile
+from pydantic import BaseModel, Field
+from crewai.tools import BaseTool
+
+from ai_research_backend.storage import upload_file
+
+logger = logging.getLogger(__name__)
+
+_EXT_TO_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "tiff": "image/tiff",
+    "webp": "image/webp",
+}
 
 
 class ArxivSearchToolInput(BaseModel):
@@ -23,24 +38,13 @@ class ArxivSearchTool(BaseTool):
     args_schema: Type[BaseModel] = ArxivSearchToolInput
 
     def search_papers(self, topic: str) -> List[dict]:
-        """Search Arxiv and return structured data"""
+        """Search Arxiv and return structured data."""
         try:
-            # Search Arxiv
             search = arxiv.Search(
                 query=topic, max_results=10, sort_by=arxiv.SortCriterion.Relevance
             )
 
             results = []
-
-            # Ensure download directory exists
-            download_dir = "downloaded_papers"
-            os.makedirs(download_dir, exist_ok=True)
-
-            # Ensure static images directory exists
-            # We want this relative to the project root where api.py runs
-            # Assuming api.py is run from ai_research_backend or parent
-            static_dir = os.path.join(os.getcwd(), "static", "extracted_images")
-            os.makedirs(static_dir, exist_ok=True)
 
             for result in search.results():
                 arxiv_id = result.entry_id.split("/")[-1]
@@ -53,79 +57,69 @@ class ArxivSearchTool(BaseTool):
                     "pdf_url": result.pdf_url,
                     "content": "",
                     "images": [],
+                    "pdf_storage_path": "",
                 }
 
-                # Download PDF
-                pdf_filename = f"{result.entry_id.split('/')[-1]}.pdf"
-                pdf_path = os.path.join(download_dir, pdf_filename)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    pdf_filename = f"{arxiv_id}.pdf"
+                    pdf_path = os.path.join(tmpdir, pdf_filename)
+                    result.download_pdf(dirpath=tmpdir, filename=pdf_filename)
 
-                # Check if we need to download it (simple cache check)
-                if not os.path.exists(pdf_path):
-                    result.download_pdf(dirpath=download_dir, filename=pdf_filename)
+                    try:
+                        doc = fitz.open(pdf_path)
+                        text = ""
+                        extracted_images: List[str] = []
 
-                # Extract text and images using PyMuPDF
-                try:
-                    doc = fitz.open(pdf_path)
-                    text = ""
-                    extracted_images = []
+                        for page_index, page in enumerate(doc[:5]):
+                            text += page.get_text()
 
-                    # extracting text from the first 5 pages to avoid token limits,
-                    # usually introduction and methods are here.
-                    # Adjust limit as needed for context window.
-                    for page_index, page in enumerate(doc[:5]):
-                        text += page.get_text()
+                            image_list = page.get_images()
+                            for img_index, img in enumerate(image_list):
+                                xref = img[0]
+                                base_image = doc.extract_image(xref)
+                                image_bytes = base_image["image"]
+                                image_ext = base_image["ext"]
 
-                        # Extract images from page
-                        image_list = page.get_images()
-                        for img_index, img in enumerate(image_list):
-                            xref = img[0]
-                            base_image = doc.extract_image(xref)
-                            image_bytes = base_image["image"]
-                            image_ext = base_image["ext"]
+                                if len(image_bytes) < 1000:
+                                    continue
 
-                            # Filter small icons/logos by size if possible, skipping for now to be safe
-                            if len(image_bytes) < 1000:  # Skip very small images
-                                continue
+                                storage_path = f"extracted_images/{arxiv_id}_p{page_index}_i{img_index}.{image_ext}"
+                                mime = _EXT_TO_MIME.get(image_ext, "application/octet-stream")
 
-                            image_filename = f"{result.entry_id.split('/')[-1]}_p{page_index}_i{img_index}.{image_ext}"
-                            image_path = os.path.join(static_dir, image_filename)
+                                try:
+                                    url = upload_file(storage_path, image_bytes, mime)
+                                    extracted_images.append(url)
+                                except Exception as exc:
+                                    logger.warning("Image upload failed: %s", exc)
 
-                            with open(image_path, "wb") as f:
-                                f.write(image_bytes)
+                        paper_info["content"] = text
+                        paper_info["images"] = extracted_images
+                        doc.close()
 
-                            # Store relative path for API
-                            extracted_images.append(
-                                f"/static/extracted_images/{image_filename}"
-                            )
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        pdf_storage_path = f"pdfs/{arxiv_id}.pdf"
+                        try:
+                            upload_file(pdf_storage_path, pdf_bytes, "application/pdf")
+                            paper_info["pdf_storage_path"] = pdf_storage_path
+                        except Exception as exc:
+                            logger.warning("PDF upload failed for %s: %s", arxiv_id, exc)
 
-                    paper_info["content"] = text
-                    paper_info["images"] = extracted_images
-                    doc.close()
-
-                    # Clean up downloaded PDF file
-                    if os.path.exists(pdf_path):
-                        os.remove(pdf_path)
-
-                except Exception as e:
-                    paper_info["content"] = f"Error extracting text/images: {str(e)}"
-                    print(f"Extraction error: {e}")
+                    except Exception as e:
+                        paper_info["content"] = f"Error extracting text/images: {str(e)}"
+                        logger.error("Extraction error for %s: %s", arxiv_id, e)
 
                 results.append(paper_info)
 
-            # Cleanup directory if empty
-            if os.path.exists(download_dir) and not os.listdir(download_dir):
-                os.rmdir(download_dir)
-
             return results
         except Exception as e:
-            print(f"Error in search_papers: {e}")
+            logger.error("Error in search_papers: %s", e)
             return []
 
     def _run(self, topic: str) -> str:
         try:
             results = self.search_papers(topic)
 
-            # Format the output
             output_str = f"Found {len(results)} papers for topic '{topic}':\n\n"
             for i, paper in enumerate(results, 1):
                 output_str += f"Paper {i}: {paper['title']}\n"
@@ -133,7 +127,7 @@ class ArxivSearchTool(BaseTool):
                 output_str += f"Published: {paper['published']}\n"
                 output_str += f"URL: {paper['pdf_url']}\n"
                 output_str += f"Summary: {paper['summary']}\n"
-                output_str += f"Extracted Content (First 5 pages): {paper['content'][:2000]}...\n"  # Truncate for safety
+                output_str += f"Extracted Content (First 5 pages): {paper['content'][:2000]}...\n"
                 output_str += "-" * 50 + "\n"
 
             return output_str

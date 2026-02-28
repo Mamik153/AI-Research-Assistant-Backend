@@ -1,6 +1,6 @@
 # AI Research Assistant — Backend
 
-Backend service for the AI Research Assistant. Searches ArXiv for academic papers, builds a persistent knowledge base with semantic embeddings, and uses a multi-agent LLM pipeline to synthesise structured research reports.
+Backend service for the AI Research Assistant. Searches ArXiv for academic papers, builds a persistent knowledge base with semantic embeddings in Supabase pgvector, and uses a multi-agent LLM pipeline to synthesise structured research reports. Optional PageIndex hybrid retrieval adds tree-based reasoning for deeper document understanding.
 
 ## Architecture
 
@@ -12,21 +12,27 @@ Request (topic)
 │  FastAPI  (/api/research/dynamic)│
 └──────────┬───────────────────────┘
            │
-    ┌──────▼──────┐   hit    ┌─────────────────────┐
-    │  ChromaDB   │─────────►│ Return cached context│
-    │ (persistent)│          └──────────┬───────────┘
-    └──────┬──────┘                     │
-           │ miss                       │
-    ┌──────▼──────┐                     │
-    │ ArXiv Search│                     │
-    │ + PDF Extract│                    │
-    └──────┬──────┘                     │
-           │ chunk + embed + dedup      │
-    ┌──────▼──────┐                     │
-    │  ChromaDB   │◄────────────────────┘
-    │  (updated)  │
-    └──────┬──────┘
-           │ top-K retrieval
+    ┌──────▼──────────┐  hit  ┌─────────────────────┐
+    │ Supabase pgvector│──────►│ Return cached context│
+    │ (cloud)          │       └──────────┬───────────┘
+    └──────┬──────────┘                   │
+           │ miss                         │
+    ┌──────▼──────┐                       │
+    │ ArXiv Search│                       │
+    │ + PDF Extract│                      │
+    └──────┬──────┘                       │
+           │ chunk + embed + upload       │
+    ┌──────▼──────────┐                   │
+    │ Supabase pgvector│◄─────────────────┘
+    │ (updated)        │
+    └──────┬──────────┘
+           │ Stage 1: vector search
+    ┌──────▼──────────────────────┐
+    │  PageIndex (if enabled)     │
+    │  Stage 2: tree reasoning    │
+    │  + context fusion           │
+    └──────┬──────────────────────┘
+           │ enriched context
     ┌──────▼──────────────────────────────┐
     │        Multi-Agent Pipeline         │
     │                                     │
@@ -41,7 +47,7 @@ Request (topic)
     ┌──────▼──────┐
     │  Post-proc  │  Mermaid formatting, section visuals,
     │  + Visuals  │  math rendering, chart generation
-    └──────┬──────┘
+    └──────┬──────┘     (uploaded to Supabase Storage)
            │
            ▼
      JSON Response
@@ -49,13 +55,14 @@ Request (topic)
 
 ### Research flow
 
-1. **Similarity search first** — The persistent ChromaDB vector store is queried before downloading anything. If enough relevant chunks already exist (>= 15 within distance threshold), the ArXiv step is skipped entirely.
-2. **ArXiv download + embed** — When new papers are needed, they are fetched from ArXiv, text/images extracted via PyMuPDF, cleaned, chunked (1500 chars / 300 overlap) with rich metadata, and stored persistently. Papers already in the store (matched by `arxiv_id`) are deduplicated.
-3. **Multi-agent pipeline** — Three specialised agents replace a single monolithic LLM call:
+1. **Similarity search first** — The Supabase pgvector store is queried before downloading anything. If enough relevant chunks already exist (>= 15 above similarity threshold), the ArXiv step is skipped entirely.
+2. **ArXiv download + embed** — When new papers are needed, they are fetched from ArXiv, text/images extracted via PyMuPDF, images and PDFs uploaded to Supabase Storage, text chunked (1500 chars / 300 overlap) with rich metadata, and embeddings stored in Supabase pgvector. Papers already in the store (matched by `arxiv_id`) are deduplicated.
+3. **Hybrid retrieval (optional)** — When `PAGEINDEX_ENABLED=true`, the top 3 papers from vector search undergo PageIndex tree-based reasoning. An LLM navigates the document's hierarchical structure to identify precisely relevant sections. Results are fused with vector chunks for enriched context.
+4. **Multi-agent pipeline** — Three specialised agents replace a single monolithic LLM call:
    - **Paper Analyzer** (sub-model) extracts structured findings: key findings, methodologies, statistics, comparisons, timeline, applications, risks.
    - **Synthesis Agent** (main model) writes the narrative summary and structured sections, receiving the analyzer output as pre-extracted data.
    - **Diagram Agent** (sub-model) generates properly formatted Mermaid diagrams with strict syntax rules. Runs in parallel with the Synthesis Agent.
-4. **Post-processing** — Mermaid diagrams are reformatted (multi-line, quoted labels, validated). LaTeX expressions are rendered to PNG. Statistics and comparison charts are generated via matplotlib.
+5. **Post-processing** — Mermaid diagrams are reformatted (multi-line, quoted labels, validated). LaTeX expressions are rendered to PNG and uploaded to Supabase Storage. Statistics and comparison charts are generated via matplotlib and uploaded.
 
 ### Key files
 
@@ -63,9 +70,12 @@ Request (topic)
 |---|---|
 | `src/ai_research_backend/api.py` | FastAPI app, endpoints, Mermaid formatting, job orchestration |
 | `src/ai_research_backend/agents.py` | Multi-agent pipeline (Paper Analyzer, Synthesis, Diagram) |
-| `src/ai_research_backend/rag.py` | Persistent ChromaDB, chunking, similarity search, deduplication |
+| `src/ai_research_backend/rag.py` | Supabase pgvector, chunking, embedding, similarity search, deduplication |
+| `src/ai_research_backend/storage.py` | Supabase Storage wrapper (upload, download, public URLs) |
+| `src/ai_research_backend/tree_index.py` | PageIndex tree generation, caching, LLM tree search |
+| `src/ai_research_backend/hybrid_retrieval.py` | Two-stage retrieval orchestrator (vector + tree + fusion) |
 | `src/ai_research_backend/crew.py` | LLM configuration (main + sub-agent), CrewAI crew definition |
-| `src/ai_research_backend/tools/arxiv_tool.py` | ArXiv search, PDF download, text/image extraction |
+| `src/ai_research_backend/tools/arxiv_tool.py` | ArXiv search, PDF download, text/image extraction, Supabase upload |
 | `src/ai_research_backend/section_visuals.py` | LaTeX rendering, statistics/comparison chart generation |
 | `src/ai_research_backend/models.py` | Pydantic models for API requests/responses |
 | `src/ai_research_backend/job_manager.py` | In-memory job status tracking, file-based result storage |
@@ -80,6 +90,15 @@ Requires Python >= 3.10, < 3.14. Uses [uv](https://docs.astral.sh/uv/) for depen
 pip install uv
 cd ai_research_backend
 uv sync
+```
+
+### Supabase setup
+
+Before running the server, create a Supabase project and run the SQL setup script:
+
+```bash
+# Copy the SQL from docs/supabase_setup.sql into the Supabase SQL Editor
+# This creates the pgvector extension, paper_chunks table, match_chunks RPC, and storage bucket
 ```
 
 ## Configuration
@@ -102,13 +121,21 @@ OLLAMA_SUB_MODEL=llama3.2:3b
 OLLAMA_SUB_API_BASE=http://localhost:11434/v1
 OLLAMA_SUB_API_KEY=ollama
 
-# Base URL prepended to image paths in API responses
-API_BASE_URL=http://localhost:8000
+# Supabase (required)
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-service-role-key
+SUPABASE_STORAGE_BUCKET=research-assets
+
+# PageIndex hybrid retrieval (optional)
+PAGEINDEX_ENABLED=false
+PAGEINDEX_MODE=self_hosted
+PAGEINDEX_MODEL=
+PAGEINDEX_MAX_TREE_PAPERS=3
 ```
 
 | Variable | Default | Description |
 |---|---|---|
-| `API_KEY` | — | **Required.** Shared secret for research endpoints. Send as `Authorization: Bearer <key>` or `X-API-Key: <key>`. If unset, all research requests return 501. |
+| `API_KEY` | — | **Required.** Shared secret for research endpoints. Send as `Authorization: Bearer <key>` or `X-API-Key: <key>`. |
 | `MAX_CONCURRENT_RESEARCH_JOBS` | `1` | Max number of pending/running jobs. New submissions get 503 "Server busy" when at capacity. |
 | `RATE_LIMIT_PER_MINUTE` | `10` | Max requests per minute per client (IP) on research endpoints. Exceeding returns 429. |
 | `OLLAMA_API_KEY` | — | API key for the main Ollama Cloud model |
@@ -117,7 +144,14 @@ API_BASE_URL=http://localhost:8000
 | `OLLAMA_SUB_MODEL` | *(empty = use main)* | Smaller model for Paper Analyzer and Diagram Agent |
 | `OLLAMA_SUB_API_BASE` | `http://localhost:11434/v1` | Base URL for the sub-agent model (e.g. local Ollama) |
 | `OLLAMA_SUB_API_KEY` | `ollama` | API key for the sub-agent model |
-| `API_BASE_URL` | `http://localhost:8000` | Absolute URL prefix for image paths in responses |
+| `SUPABASE_URL` | — | **Required.** Supabase project URL |
+| `SUPABASE_KEY` | — | **Required.** Supabase service-role key |
+| `SUPABASE_STORAGE_BUCKET` | `research-assets` | Supabase Storage bucket name |
+| `PAGEINDEX_ENABLED` | `false` | Enable PageIndex hybrid retrieval |
+| `PAGEINDEX_MODE` | `self_hosted` | `self_hosted` (open-source + Ollama) or `cloud` (PageIndex Cloud API) |
+| `PAGEINDEX_API_KEY` | — | Required only for `cloud` mode |
+| `PAGEINDEX_MODEL` | *(uses OLLAMA_MODEL)* | Model for tree generation and tree search |
+| `PAGEINDEX_MAX_TREE_PAPERS` | `3` | Max papers to tree-index per request |
 | `TAVILY_API_KEY` | — | *(Optional)* Tavily web search API key |
 
 ### Using a local Ollama model for sub-agents
@@ -182,19 +216,22 @@ The dynamic result includes: `summary`, `key_insights`, `generated_diagrams` (Me
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Health check / root |
-| `GET` | `/static/...` | Extracted images, rendered math, generated charts |
 
 CORS is configured for `http://localhost:5173` and `*.slickspender.com`.
 
 ## Data storage
 
-| Path | Persisted | Description |
-|---|---|---|
-| `chroma_db/` | Yes | Persistent ChromaDB vector store (paper embeddings) |
-| `results/` | Yes (per job) | JSON result files, cleaned up after 1 hour |
-| `static/extracted_images/` | Yes (per job) | Images extracted from paper PDFs |
-| `static/generated_math/` | Yes (per job) | Rendered LaTeX equation PNGs |
-| `static/generated_charts/` | Yes (per job) | Matplotlib bar/comparison charts |
+All persistent data is stored in Supabase (cloud). The server is stateless.
+
+| Location | Description |
+|---|---|
+| Supabase pgvector (`paper_chunks` table) | Paper chunk embeddings and metadata |
+| Supabase Storage `extracted_images/` | Images extracted from paper PDFs |
+| Supabase Storage `generated_math/` | Rendered LaTeX equation PNGs |
+| Supabase Storage `generated_charts/` | Matplotlib bar/comparison charts |
+| Supabase Storage `pdfs/` | Paper PDFs (for PageIndex tree generation) |
+| Supabase Storage `tree_indexes/` | Cached PageIndex tree structures (JSON) |
+| Local `results/` | Job result JSON files (in-memory + file backup, evicted after 2 hours) |
 
 ## Chunking and embedding strategy
 
@@ -205,4 +242,16 @@ Papers are split into two chunk types:
 
 Each chunk carries rich metadata: `title`, `authors`, `published`, `arxiv_id`, `pdf_url`, `chunk_type`, `chunk_position` (start/middle/end), `chunk_index`, `total_chunks`, and `topic_query`.
 
+Embeddings are generated using `all-MiniLM-L6-v2` (384 dimensions) via sentence-transformers and stored in Supabase pgvector with IVFFlat indexing.
+
 Deduplication is by `arxiv_id` — if a paper is already in the vector store, its chunks are not re-added.
+
+## Hybrid retrieval (PageIndex)
+
+When `PAGEINDEX_ENABLED=true`, retrieval uses a two-stage pipeline:
+
+1. **Stage 1 (vector search)** — Supabase pgvector identifies the most semantically similar chunks and ranks papers by average similarity score.
+2. **Stage 2 (tree reasoning)** — The top 3 papers undergo PageIndex tree generation. An LLM navigates the document's hierarchical structure to identify precisely relevant sections, extracting text from targeted page ranges.
+3. **Context fusion** — Vector search chunks (broad coverage) and tree-retrieved sections (precise relevance) are merged with source attribution (`[vector-search]` vs `[tree-search]`) and passed to the multi-agent pipeline.
+
+Tree indexes are cached in Supabase Storage, so subsequent queries for the same paper skip tree generation.

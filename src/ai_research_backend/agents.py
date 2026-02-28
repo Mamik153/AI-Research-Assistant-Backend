@@ -173,13 +173,27 @@ STRICT FORMAT RULES:
 - Do NOT use semicolons to separate statements.
 - Do NOT wrap in markdown code fences.
 
-GOOD example:
-"graph TD\\n    A[\\"Data Collection\\"] --> B[\\"Preprocessing\\"]\\n    B --> C[\\"Model Training\\"]\\n    C --> D[\\"Evaluation\\"]"
+FLOWCHART/GRAPH (graph TD, graph LR, flowchart LR, etc.):
+- Every node MUST have a node ID. Use NodeID["Label"] or NodeID("Label"). Never use a bare quoted string as a node.
+- BAD: "Hallucination Mitigation" --> X  or  "Some Concept" --> Y  (bare quoted string has no ID).
+- GOOD: Hallucination["Hallucination Mitigation"] --> X  or  SomeConcept["Some Concept"] --> Y.
+
+SEQUENCE DIAGRAM (sequenceDiagram):
+- Declare each participant first: participant Id as "Display Label"  or  actor Id as "Display Label".
+- In arrows use ONLY these declared IDs: Id ->> OtherId: message text.
+- Do NOT use bracket syntax for participants (e.g. Actor["User Query"] or SLM1["Small Language Model"] is INVALID).
+- Message text after the colon may be in quotes if it contains special characters.
+
+GOOD examples:
+Flowchart: "graph TD\\n    A[\\"Data Collection\\"] --> B[\\"Preprocessing\\"]\\n    B --> C[\\"Model Training\\"]\\n    C --> D[\\"Evaluation\\"]"
+Sequence: "sequenceDiagram\\n    participant U as \\"User\\"\\n    participant S as \\"Server\\"\\n    U ->> S: Request\\n    S ->> U: Response"
 
 BAD examples (never do these):
 - "graph TD; A --> B; B --> C"  (semicolons)
 - "graph TD A --> B"  (missing newlines)
 - "Input Node --> Output Node"  (spaces in IDs)
+- "Some Concept" --> X  (flowchart: bare quoted string as node; use SomeConcept[\"Some Concept\"] --> X)
+- Actor["User Query"] or SLM1["Small Language Model"]  (sequenceDiagram: use participant Id as \"Label\" then Id in arrows)
 
 Key Findings:
 {findings}"""

@@ -1,6 +1,6 @@
 [project]
 name = "ai_research_backend"
-version = "0.5.1"
+version = "0.6.0"
 description = "ai-research-backend using crewAI"
 authors = [{ name = "Your Name", email = "you@example.com" }]
 requires-python = ">=3.10,<3.14"
@@ -12,11 +12,17 @@ dependencies = [
     "python-multipart>=0.0.6",
     "arxiv>=2.1.0",
     "pymupdf>=1.27.1",
-    "chromadb>=1.0.0",
+    "supabase>=2.0.0",
+    "sentence-transformers>=3.0.0",
     "langchain-text-splitters>=0.3.0",
     "matplotlib>=3.8.0",
     "slowapi>=0.1.9",
+    "pageindex>=0.1.0",
+    "tiktoken>=0.5.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
 
 [project.scripts]
 ai_research_backend = "ai_research_backend.main:run"

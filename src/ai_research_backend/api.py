@@ -6,13 +6,11 @@ import uuid as uuid_mod
 from datetime import datetime
 from typing import Dict, List, Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends, Header
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 import os
-import asyncio
-import shutil
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -43,7 +41,6 @@ from ai_research_backend.crew import AiResearchBackend
 
 logger = logging.getLogger(__name__)
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = (os.getenv("API_KEY") or "").strip()
 RATE_LIMIT_STRING = os.getenv("RATE_LIMIT_PER_MINUTE", "10") + "/minute"
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_RESEARCH_JOBS", "1"))
@@ -164,76 +161,12 @@ app.add_middleware(
     allow_headers=["Authorization", "X-API-Key", "Content-Type"],
 )
 
-static_dir = os.path.join(os.getcwd(), "static")
-os.makedirs(static_dir, exist_ok=True)
-
-
-@app.get("/static/{file_path:path}")
-async def serve_static(
-    file_path: str,
-    _: None = Depends(verify_api_key),
-):
-    """Serve static files with API key authentication."""
-    safe_path = os.path.normpath(file_path)
-    if safe_path.startswith("..") or os.path.isabs(safe_path):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    full_path = os.path.join(static_dir, safe_path)
-    if not full_path.startswith(os.path.realpath(static_dir)):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if not os.path.isfile(full_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(full_path)
-
-
 def _validate_job_id(job_id: str) -> None:
     """Validate that job_id is a proper UUID to prevent path traversal."""
     try:
         uuid_mod.UUID(job_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid job ID format")
-
-
-async def delayed_cleanup(delay_seconds: int = 3600):
-    """
-    Wait for the specified delay, then delete all files in the results and static/extracted_images directories.
-    """
-    await asyncio.sleep(delay_seconds)
-    logger.info("Starting delayed cleanup of results and extracted images...")
-
-    # Paths to clean
-    results_dir = os.path.join(os.getcwd(), "results")
-    dirs_to_clean = [
-        os.path.join(os.getcwd(), "static", "extracted_images"),
-        os.path.join(os.getcwd(), "static", "generated_math"),
-        os.path.join(os.getcwd(), "static", "generated_charts"),
-    ]
-
-    # Clean results directory
-    if os.path.exists(results_dir):
-        for filename in os.listdir(results_dir):
-            file_path = os.path.join(results_dir, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                logger.error(f"Failed to delete {file_path}. Reason: {e}")
-
-    # Clean static image directories
-    for dir_path in dirs_to_clean:
-        if os.path.exists(dir_path):
-            for filename in os.listdir(dir_path):
-                file_path = os.path.join(dir_path, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                except Exception as e:
-                    logger.error(f"Failed to delete {file_path}. Reason: {e}")
-
-    logger.info("Delayed cleanup completed.")
 
 
 def _parse_structured_sections(data: Optional[dict]) -> StructuredSections:
@@ -279,15 +212,6 @@ def _normalize_section_images(
         if filtered:
             result[key] = filtered
     return result if result else None
-
-
-def _to_absolute_url(path: str) -> str:
-    """Convert a relative image path to an absolute URL using API_BASE_URL."""
-    if not path or not isinstance(path, str):
-        return path
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-    return f"{API_BASE_URL}{path}" if path.startswith("/") else f"{API_BASE_URL}/{path}"
 
 
 def _unwrap_llm_response(llm_data: Optional[dict]) -> dict:
@@ -430,6 +354,72 @@ _MERMAID_EDGE_OR_NODE_RE = re.compile(
 
 _MERMAID_SPECIAL_LABEL_CHARS = re.compile(r'[():{}&<>"]')
 
+# Bare quoted node: "Label" not inside brackets (left of edge); capture arrow
+_MERMAID_BARE_QUOTED_LEFT_RE = re.compile(
+    r'(?<!\])"([^"]+)"\s*((?:-->|--|---|->|<-|===|==>))'
+)
+# Bare quoted node: "Label" not inside brackets (right of edge)
+_MERMAID_BARE_QUOTED_RIGHT_RE = re.compile(
+    r'(-->|--|---|->|<-|===|==>)\s*"([^"]+)"(?!\])'
+)
+
+
+def _label_to_node_id(label: str, max_length: int = 30) -> str:
+    """Convert a display label to a Mermaid node ID (no spaces, camelCase)."""
+    s = "".join(
+        w.capitalize() for w in re.sub(r"[^a-zA-Z0-9\s]", " ", label).split()
+    )
+    return s[:max_length] if s else "N"
+
+
+def _repair_flowchart_bare_quoted_nodes(diagram: str) -> str:
+    """Replace bare quoted nodes like \"Label\" with Id[\"Label\"] in flowchart/graph only."""
+    lines = diagram.split("\n")
+    if not lines:
+        return diagram
+    first = lines[0].strip().split()
+    if not first:
+        return diagram
+    prefix = first[0].lower()
+    if not (prefix.startswith("graph") or prefix.startswith("flowchart")):
+        return diagram
+
+    # Build label -> id map only from bare-quoted nodes (not labels inside [...])
+    label_to_id: Dict[str, str] = {}
+    for line in lines[1:]:
+        for match in _MERMAID_BARE_QUOTED_LEFT_RE.finditer(line):
+            label = match.group(1)
+            if label and label not in label_to_id:
+                label_to_id[label] = _label_to_node_id(label)
+        for match in _MERMAID_BARE_QUOTED_RIGHT_RE.finditer(line):
+            label = match.group(2)
+            if label and label not in label_to_id:
+                label_to_id[label] = _label_to_node_id(label)
+
+    if not label_to_id:
+        return diagram
+
+    def replace_bare_left(match: re.Match) -> str:
+        label, arrow = match.group(1), match.group(2)
+        node_id = label_to_id.get(label, _label_to_node_id(label))
+        escaped_label = label.replace('"', "'")
+        return f'{node_id}["{escaped_label}"] {arrow}'
+
+    def replace_bare_right(match: re.Match) -> str:
+        edge, label = match.group(1), match.group(2)
+        node_id = label_to_id.get(label, _label_to_node_id(label))
+        escaped_label = label.replace('"', "'")
+        return f'{edge} {node_id}["{escaped_label}"]'
+
+    result_lines = [lines[0]]
+    for line in lines[1:]:
+        head = line.split(":", 1)[0] if ":" in line else line
+        tail = (" " + line.split(":", 1)[1]) if ":" in line else ""
+        head = _MERMAID_BARE_QUOTED_LEFT_RE.sub(replace_bare_left, head)
+        head = _MERMAID_BARE_QUOTED_RIGHT_RE.sub(replace_bare_right, head)
+        result_lines.append(head + tail)
+    return "\n".join(result_lines)
+
 
 def _sanitize_mermaid(diagram: str) -> Optional[str]:
     """Strip markdown code fences and trim. Returns None if empty after sanitization."""
@@ -487,7 +477,8 @@ def _format_mermaid_diagram(diagram: str) -> str:
         if line:
             output_lines.append("    " + line)
 
-    return "\n".join(output_lines)
+    result = "\n".join(output_lines)
+    return _repair_flowchart_bare_quoted_nodes(result)
 
 
 def _is_valid_mermaid(diagram: str) -> bool:
@@ -846,10 +837,8 @@ def run_dynamic_research_job(job_id: str, topic: str):
         )
 
         from ai_research_backend.crew import active_llm, sub_llm
-        from ai_research_backend.rag import (
-            search_existing_knowledge,
-            retrieve_relevant_chunks,
-        )
+        from ai_research_backend.rag import search_existing_knowledge
+        from ai_research_backend.hybrid_retrieval import hybrid_retrieve
         from ai_research_backend.agents import run_research_agents
 
         # ---- Step 1: Similarity search on existing knowledge base ----
@@ -905,11 +894,11 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 job_id,
                 "Embedding papers into knowledge base",
                 45,
-                "Storing paper chunks with rich metadata for semantic retrieval",
+                "Storing paper chunks and running hybrid retrieval",
             )
 
             papers_for_context = papers[:7]
-            papers_context = retrieve_relevant_chunks(papers_for_context, topic)
+            papers_context = hybrid_retrieve(papers_for_context, topic)
 
         # ---- Build section_images_instruction for synthesis agent ----
         available_image_urls: List[str] = []
@@ -993,19 +982,15 @@ Available Images (use ONLY these URLs in section_images):
                 generate_comparison_chart,
             )
 
-            math_images = render_section_math(sections_dict, job_id, static_dir)
+            math_images = render_section_math(sections_dict, job_id)
             for key, urls in math_images.items():
                 section_images.setdefault(key, []).extend(urls)
 
-            stats_chart_url = generate_statistics_chart(
-                sections_dict, job_id, static_dir
-            )
+            stats_chart_url = generate_statistics_chart(sections_dict, job_id)
             if stats_chart_url:
                 section_images.setdefault("statistics", []).append(stats_chart_url)
 
-            comp_chart_url = generate_comparison_chart(
-                sections_dict, job_id, static_dir
-            )
+            comp_chart_url = generate_comparison_chart(sections_dict, job_id)
             if comp_chart_url:
                 section_images.setdefault("comparisons", []).append(comp_chart_url)
         except Exception as e:
@@ -1084,7 +1069,6 @@ async def submit_dynamic_research(
 async def get_dynamic_research_result(
     request: Request,
     job_id: str,
-    background_tasks: BackgroundTasks,
     _: None = Depends(verify_api_key),
 ):
     """Get the result of a completed dynamic research job"""
@@ -1120,25 +1104,17 @@ async def get_dynamic_research_result(
     else:
         structured_sections = StructuredSections()
 
-    # Convert image URLs to absolute so the frontend can load them from any origin
     papers_data = result.get("papers", [])
-    for paper in papers_data:
-        if isinstance(paper, dict) and "images" in paper:
-            paper["images"] = [_to_absolute_url(u) for u in paper["images"]]
 
     raw_section_images = result.get("section_images")
     if isinstance(raw_section_images, dict):
         section_images = {
-            k: [_to_absolute_url(u) for u in urls]
+            k: urls
             for k, urls in raw_section_images.items()
             if isinstance(urls, list)
         }
     else:
         section_images = None
-
-    # Schedule delayed cleanup after returning the result
-    # Delay is set to 3600 seconds (1 hour)
-    background_tasks.add_task(delayed_cleanup, 3600)
 
     return DynamicResearchResultResponse(
         topic=result.get("topic", ""),

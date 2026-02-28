@@ -1,6 +1,4 @@
 .env
 __pycache__/
 .DS_Store
-static/extracted_images
 results
-chroma_db/

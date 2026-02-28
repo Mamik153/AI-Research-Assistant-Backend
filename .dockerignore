@@ -6,9 +6,5 @@ __pycache__
 .pytest_cache
 .coverage
 htmlcov
-chroma_db
 results
-static/extracted_images
-static/generated_math
-static/generated_charts
 *.md

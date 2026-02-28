@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-02-28
+
+### Fix
+- **Mermaid diagram generation:** Diagram Agent prompt now enforces valid syntax: flowcharts/graphs must use `NodeID["Label"]` (no bare quoted strings as nodes), and sequence diagrams must use `participant Id as "Label"` with only `Id` in arrows (no bracket syntax like `Actor["User Query"]`). Added post-processing in `_format_mermaid_diagram` to repair bare-quoted nodes in flowchart/graph by rewriting them to `Id["Label"]` form; labels inside existing brackets are left unchanged. Fixes frontend renderer failures for generated diagrams.
+
+### BREAKING CHANGE
+- Replaced local ChromaDB vector store with **Supabase pgvector**. The `chroma_db/` directory is no longer created or used. Requires `SUPABASE_URL` and `SUPABASE_KEY` environment variables.
+- Removed the `/static/{file_path}` endpoint. All images (extracted paper figures, rendered LaTeX, generated charts) are now served directly from **Supabase Storage** CDN URLs. Clients no longer need to authenticate static file requests separately.
+- Removed `API_BASE_URL` environment variable (no longer needed; image URLs are absolute Supabase Storage URLs).
+
+### Major change
+- **Supabase cloud migration:** All persistent storage moved to Supabase — pgvector for chunk embeddings/metadata and Storage for images, PDFs, and tree caches. The server is now fully stateless (no local disk writes except short-lived job result JSON).
+- **PageIndex hybrid retrieval:** New two-stage retrieval pipeline behind `PAGEINDEX_ENABLED` feature flag. Stage 1 uses Supabase pgvector for broad vector similarity search. Stage 2 uses PageIndex tree-based reasoning to deeply analyse the top 3 papers, extracting precisely relevant sections via LLM-guided tree navigation. Tree indexes are cached in Supabase Storage for reuse.
+- Embeddings are now generated explicitly using `sentence-transformers` (`all-MiniLM-L6-v2`, 384 dimensions) — same model as ChromaDB's default, preserving retrieval behavior.
+
+### Minor change
+- Added new modules: `storage.py` (Supabase Storage wrapper), `tree_index.py` (PageIndex integration), `hybrid_retrieval.py` (two-stage retrieval orchestrator).
+- ArXiv tool now uploads extracted images and PDFs to Supabase Storage instead of writing to local filesystem.
+- Section visuals (math rendering, charts) now render to in-memory buffers and upload to Supabase Storage.
+- Removed `delayed_cleanup()` function — no local files to clean up.
+- Added `docs/supabase_setup.sql` with full database and storage bucket setup instructions.
+
 ## [0.5.1] - 2026-02-28
 
 ### Fix
