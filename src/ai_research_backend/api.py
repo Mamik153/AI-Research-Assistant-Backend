@@ -1,16 +1,21 @@
 import hmac
 import json
 import logging
+import os
 import re
 import uuid as uuid_mod
 from datetime import datetime
 from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
-import os
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -37,9 +42,39 @@ from ai_research_backend.job_manager import (
     add_intermediate_finding,
     count_ongoing_jobs,
 )
-from ai_research_backend.crew import AiResearchBackend
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Eagerly import heavy research modules so failures surface at startup (or at
+# least on the first import attempt) rather than silently hanging inside a
+# background task.  Each block is isolated so one broken dependency does not
+# prevent the rest from loading.
+# ---------------------------------------------------------------------------
+try:
+    from ai_research_backend.crew import active_llm, sub_llm
+except Exception:
+    logger.warning("Could not import crew module — LLMs will be unavailable", exc_info=True)
+    active_llm = None  # type: ignore[assignment]
+    sub_llm = None  # type: ignore[assignment]
+
+try:
+    from ai_research_backend.rag import search_existing_knowledge
+except Exception:
+    logger.warning("Could not import rag module — knowledge-base search unavailable", exc_info=True)
+    search_existing_knowledge = None  # type: ignore[assignment]
+
+try:
+    from ai_research_backend.hybrid_retrieval import hybrid_retrieve
+except Exception:
+    logger.warning("Could not import hybrid_retrieval module", exc_info=True)
+    hybrid_retrieve = None  # type: ignore[assignment]
+
+try:
+    from ai_research_backend.agents import run_research_agents
+except Exception:
+    logger.warning("Could not import agents module", exc_info=True)
+    run_research_agents = None  # type: ignore[assignment]
 
 API_KEY = (os.getenv("API_KEY") or "").strip()
 RATE_LIMIT_STRING = os.getenv("RATE_LIMIT_PER_MINUTE", "10") + "/minute"
@@ -609,7 +644,8 @@ def run_research_job(job_id: str, topic: str):
             "Setting up AI agents for research",
         )
 
-        # Initialize crew
+        from ai_research_backend.crew import AiResearchBackend
+
         crew_instance = AiResearchBackend()
         crew = crew_instance.crew()
 
@@ -818,6 +854,22 @@ async def get_research_result(
     )
 
 
+JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "600"))
+
+
+def _fail_job(job_id: str, topic: str, reason: str) -> None:
+    """Mark a job as failed and persist an error result."""
+    logger.error("Job %s failed: %s", job_id, reason)
+    result_data = {
+        "error": reason,
+        "completed_at": datetime.now().isoformat(),
+        "jobId": job_id,
+        "topic": topic,
+    }
+    save_result(job_id, result_data)
+    update_job_status(job_id, "failed")
+
+
 def run_dynamic_research_job(job_id: str, topic: str):
     """Run the dynamic research job in background.
 
@@ -827,6 +879,21 @@ def run_dynamic_research_job(job_id: str, topic: str):
       3. Run multi-agent pipeline (analyzer -> synthesis + diagrams in parallel)
       4. Generate visual assets and prepare final result
     """
+    import threading
+
+    timed_out = threading.Event()
+
+    def _watchdog():
+        timed_out.set()
+        logger.error(
+            "Job %s exceeded %ds timeout — marking failed", job_id, JOB_TIMEOUT_SECONDS
+        )
+        _fail_job(job_id, topic, f"Job timed out after {JOB_TIMEOUT_SECONDS}s")
+
+    timer = threading.Timer(JOB_TIMEOUT_SECONDS, _watchdog)
+    timer.daemon = True
+    timer.start()
+
     try:
         update_job_status(job_id, "running")
         update_job_progress(
@@ -836,10 +903,12 @@ def run_dynamic_research_job(job_id: str, topic: str):
             "Preparing to research the topic",
         )
 
-        from ai_research_backend.crew import active_llm, sub_llm
-        from ai_research_backend.rag import search_existing_knowledge
-        from ai_research_backend.hybrid_retrieval import hybrid_retrieve
-        from ai_research_backend.agents import run_research_agents
+        # -- Gate: core modules must have loaded at startup --
+        if active_llm is None or run_research_agents is None:
+            raise RuntimeError(
+                "Core research modules failed to load at startup — "
+                "check server logs for import errors"
+            )
 
         # ---- Step 1: Similarity search on existing knowledge base ----
         update_job_progress(
@@ -849,7 +918,15 @@ def run_dynamic_research_job(job_id: str, topic: str):
             "Searching existing embeddings for relevant material",
         )
 
-        existing_context = search_existing_knowledge(topic)
+        existing_context: Optional[str] = None
+        if search_existing_knowledge is not None:
+            try:
+                existing_context = search_existing_knowledge(topic)
+            except Exception as exc:
+                logger.warning(
+                    "Knowledge-base search failed (will download papers): %s", exc
+                )
+
         papers: List[dict] = []
         papers_context: str = ""
 
@@ -877,7 +954,12 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 20,
                 f"Searching for papers related to: {topic}",
             )
-            papers = arxiv_tool.search_papers(topic)
+
+            try:
+                papers = arxiv_tool.search_papers(topic)
+            except Exception as exc:
+                logger.warning("ArXiv search failed: %s", exc)
+                papers = []
 
             if papers:
                 add_intermediate_finding(
@@ -898,7 +980,18 @@ def run_dynamic_research_job(job_id: str, topic: str):
             )
 
             papers_for_context = papers[:7]
-            papers_context = hybrid_retrieve(papers_for_context, topic)
+            if hybrid_retrieve is not None:
+                try:
+                    papers_context = hybrid_retrieve(papers_for_context, topic)
+                except Exception as exc:
+                    logger.warning("Hybrid retrieval failed: %s", exc)
+                    papers_context = ""
+
+        if not papers_context and not papers:
+            raise RuntimeError(
+                "No knowledge-base content and no papers retrieved — "
+                "cannot proceed with research"
+            )
 
         # ---- Build section_images_instruction for synthesis agent ----
         available_image_urls: List[str] = []
@@ -923,6 +1016,9 @@ Available Images (use ONLY these URLs in section_images):
         else:
             section_images_instruction = '"section_images": {},'
 
+        if timed_out.is_set():
+            return
+
         # ---- Step 3: Multi-agent pipeline ----
         update_job_progress(
             job_id,
@@ -938,6 +1034,9 @@ Available Images (use ONLY these URLs in section_images):
             papers_context=papers_context,
             section_images_instruction=section_images_instruction,
         )
+
+        if timed_out.is_set():
+            return
 
         logger.info("Multi-agent pipeline completed")
 
@@ -996,6 +1095,9 @@ Available Images (use ONLY these URLs in section_images):
         except Exception as e:
             logger.warning("Section visual generation failed (non-fatal): %s", e)
 
+        if timed_out.is_set():
+            return
+
         completed_at = datetime.now().isoformat()
 
         result_data = {
@@ -1024,16 +1126,11 @@ Available Images (use ONLY these URLs in section_images):
         update_job_status(job_id, "completed")
 
     except Exception as e:
-        logger.exception("Dynamic research job %s failed", job_id)
-        completed_at = datetime.now().isoformat()
-        result_data = {
-            "error": "An internal error occurred while processing the research job.",
-            "completed_at": completed_at,
-            "jobId": job_id,
-            "topic": topic,
-        }
-        save_result(job_id, result_data)
-        update_job_status(job_id, "failed")
+        if not timed_out.is_set():
+            logger.exception("Dynamic research job %s failed", job_id)
+            _fail_job(job_id, topic, "An internal error occurred while processing the research job.")
+    finally:
+        timer.cancel()
 
 
 @app.post("/api/research/dynamic", response_model=JobStatusResponse)

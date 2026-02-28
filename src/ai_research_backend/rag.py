@@ -183,17 +183,26 @@ def _similarity_search(
     threshold: float = SIMILARITY_THRESHOLD,
 ) -> list[dict]:
     """Run the match_chunks RPC against Supabase pgvector."""
-    embedding = _embed_texts([query])[0]
-    client = get_supabase_client()
-    resp = client.rpc(
-        "match_chunks",
-        {
-            "query_embedding": embedding,
-            "match_threshold": threshold,
-            "match_count": top_k,
-        },
-    ).execute()
-    return resp.data or []
+    try:
+        embedding = _embed_texts([query])[0]
+    except Exception as exc:
+        logger.error("Embedding generation failed: %s", exc)
+        return []
+
+    try:
+        client = get_supabase_client()
+        resp = client.rpc(
+            "match_chunks",
+            {
+                "query_embedding": embedding,
+                "match_threshold": threshold,
+                "match_count": top_k,
+            },
+        ).execute()
+        return resp.data or []
+    except Exception as exc:
+        logger.error("Supabase similarity search RPC failed: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -211,50 +220,57 @@ def search_existing_knowledge(
 
     Returns a formatted context string when enough relevant chunks exist,
     or ``None`` if new papers should be downloaded.
+
+    Never raises — returns ``None`` on any failure so the caller can fall
+    back to downloading papers.
     """
-    total = _count_chunks()
-    if total == 0:
-        logger.info("Knowledge base is empty — must download papers")
-        return None
+    try:
+        total = _count_chunks()
+        if total == 0:
+            logger.info("Knowledge base is empty — must download papers")
+            return None
 
-    results = _similarity_search(topic, top_k=top_k, threshold=threshold)
+        results = _similarity_search(topic, top_k=top_k, threshold=threshold)
 
-    if len(results) < min_chunks:
-        logger.info(
-            "Only %d relevant chunks found (need %d) — will download more papers",
-            len(results),
-            min_chunks,
-        )
-        return None
-
-    logger.info(
-        "Found %d relevant existing chunks for topic — skipping ArXiv download",
-        len(results),
-    )
-
-    abstract_parts: List[str] = []
-    body_parts: List[str] = []
-    seen_titles: set = set()
-
-    for row in results:
-        title = row.get("title", "Unknown")
-        if row.get("chunk_type") == "abstract" and title not in seen_titles:
-            seen_titles.add(title)
-            abstract_parts.append(f"Title: {title}\nAbstract: {row['content']}")
-        else:
-            body_parts.append(
-                f'[From: "{title}" ({row.get("chunk_position", "")})]\n{row["content"]}'
+        if len(results) < min_chunks:
+            logger.info(
+                "Only %d relevant chunks found (need %d) — will download more papers",
+                len(results),
+                min_chunks,
             )
+            return None
 
-    context = "--- Paper Abstracts (from knowledge base) ---\n"
-    context += (
-        "\n\n".join(abstract_parts)
-        if abstract_parts
-        else "(no abstracts in retrieved chunks)"
-    )
-    context += "\n\n--- Relevant Excerpts (from knowledge base) ---\n\n"
-    context += "\n\n".join(body_parts)
-    return context
+        logger.info(
+            "Found %d relevant existing chunks for topic — skipping ArXiv download",
+            len(results),
+        )
+
+        abstract_parts: List[str] = []
+        body_parts: List[str] = []
+        seen_titles: set = set()
+
+        for row in results:
+            title = row.get("title", "Unknown")
+            if row.get("chunk_type") == "abstract" and title not in seen_titles:
+                seen_titles.add(title)
+                abstract_parts.append(f"Title: {title}\nAbstract: {row['content']}")
+            else:
+                body_parts.append(
+                    f'[From: "{title}" ({row.get("chunk_position", "")})]\n{row["content"]}'
+                )
+
+        context = "--- Paper Abstracts (from knowledge base) ---\n"
+        context += (
+            "\n\n".join(abstract_parts)
+            if abstract_parts
+            else "(no abstracts in retrieved chunks)"
+        )
+        context += "\n\n--- Relevant Excerpts (from knowledge base) ---\n\n"
+        context += "\n\n".join(body_parts)
+        return context
+    except Exception as exc:
+        logger.error("search_existing_knowledge failed: %s", exc)
+        return None
 
 
 def add_papers_to_store(papers: List[dict], query: str = "") -> int:

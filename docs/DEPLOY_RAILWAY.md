@@ -47,7 +47,7 @@ By default, Railway containers are stateless. If your container restarts, local 
 1. Go to the **Volumes** tab in your service.
 2. Click **Create Volume**.
 3. Set the Mount Path to `/app/chroma_db` (since our Dockerfile uses `/app` as the working directory).
-4. You can also create volumes for `/app/results` and `/app/static` if you want to persist generated charts and PDFs.
+4. Job results and static assets (images, PDFs) are stored in Supabase Storage when configured; no volumes are needed for `/app/results` or `/app/static`.
 
 ### 5. CORS Configuration
 

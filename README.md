@@ -231,7 +231,7 @@ All persistent data is stored in Supabase (cloud). The server is stateless.
 | Supabase Storage `generated_charts/` | Matplotlib bar/comparison charts |
 | Supabase Storage `pdfs/` | Paper PDFs (for PageIndex tree generation) |
 | Supabase Storage `tree_indexes/` | Cached PageIndex tree structures (JSON) |
-| Local `results/` | Job result JSON files (in-memory + file backup, evicted after 2 hours) |
+| In-memory + optional Supabase Storage `results/` | Job results (evicted from memory after 2 hours; persisted in Supabase when configured) |
 
 ## Chunking and embedding strategy
 

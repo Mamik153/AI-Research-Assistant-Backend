@@ -4,8 +4,6 @@ import warnings
 
 from datetime import datetime
 
-from ai_research_backend.crew import AiResearchBackend
-
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 
 # This main file is intended to be a way for you to run your
@@ -17,6 +15,8 @@ def run():
     """
     Run the crew.
     """
+    from ai_research_backend.crew import AiResearchBackend
+
     inputs = {
         'topic': 'AI LLMs',
         'current_year': str(datetime.now().year)
@@ -32,6 +32,8 @@ def train():
     """
     Train the crew for a given number of iterations.
     """
+    from ai_research_backend.crew import AiResearchBackend
+
     inputs = {
         "topic": "AI LLMs",
         'current_year': str(datetime.now().year)
@@ -46,6 +48,8 @@ def replay():
     """
     Replay the crew execution from a specific task.
     """
+    from ai_research_backend.crew import AiResearchBackend
+
     try:
         AiResearchBackend().crew().replay(task_id=sys.argv[1])
 
@@ -56,6 +60,8 @@ def test():
     """
     Test the crew execution and returns the results.
     """
+    from ai_research_backend.crew import AiResearchBackend
+
     inputs = {
         "topic": "AI LLMs",
         "current_year": str(datetime.now().year)

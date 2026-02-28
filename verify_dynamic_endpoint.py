@@ -1,9 +1,16 @@
 import requests
 import time
 import json
+import os
 import sys
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 BASE_URL = "http://localhost:8000"
+API_KEY = os.getenv("API_KEY", "")
+HEADERS = {"X-API-Key": API_KEY}
 
 
 def test_dynamic_research():
@@ -11,7 +18,9 @@ def test_dynamic_research():
     topic = "Multimodal AI Agents"
     try:
         response = requests.post(
-            f"{BASE_URL}/api/research/dynamic", json={"topic": topic}
+            f"{BASE_URL}/api/research/dynamic",
+            json={"topic": topic},
+            headers=HEADERS,
         )
         response.raise_for_status()
         job_data = response.json()
@@ -26,7 +35,9 @@ def test_dynamic_research():
 
     print("2. Polling for completion...")
     while True:
-        status_response = requests.get(f"{BASE_URL}/api/research/{job_id}")
+        status_response = requests.get(
+            f"{BASE_URL}/api/research/{job_id}", headers=HEADERS
+        )
         if status_response.status_code != 200:
             print(f"   Error checking status: {status_response.text}")
             break
@@ -42,7 +53,8 @@ def test_dynamic_research():
             # Try to get error details
             try:
                 result_response = requests.get(
-                    f"{BASE_URL}/api/research/dynamic/{job_id}/result"
+                    f"{BASE_URL}/api/research/dynamic/{job_id}/result",
+                    headers=HEADERS,
                 )
                 print(f"   Error details: {result_response.text}")
             except:
@@ -52,7 +64,9 @@ def test_dynamic_research():
         time.sleep(2)
 
     print("3. Fetching results...")
-    result_response = requests.get(f"{BASE_URL}/api/research/dynamic/{job_id}/result")
+    result_response = requests.get(
+        f"{BASE_URL}/api/research/dynamic/{job_id}/result", headers=HEADERS
+    )
     if result_response.status_code == 200:
         result = result_response.json()
         print("\n--- Dynamic Research Result ---")

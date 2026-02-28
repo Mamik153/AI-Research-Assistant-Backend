@@ -1,17 +1,11 @@
-import json
 import logging
-import os
 import threading
 import time
-from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
 import uuid
 
 logger = logging.getLogger(__name__)
-
-RESULTS_DIR = Path(__file__).parent.parent.parent / "results"
-RESULTS_DIR.mkdir(exist_ok=True)
 
 JOB_TTL_SECONDS = 7200  # 2 hours
 MAX_STORED_JOBS = 500
@@ -25,6 +19,9 @@ job_created_at: Dict[str, float] = {}
 job_progress: Dict[str, dict] = {}
 job_thoughts: Dict[str, list] = {}
 job_findings: Dict[str, list] = {}
+
+# In-memory job results (optional Supabase persistence when configured)
+job_results: Dict[str, dict] = {}
 
 _eviction_lock = threading.Lock()
 
@@ -57,6 +54,8 @@ def _evict_expired_jobs() -> None:
         job_progress.pop(jid, None)
         job_thoughts.pop(jid, None)
         job_findings.pop(jid, None)
+        job_results.pop(jid, None)
+        _delete_result_from_storage(jid)
     if to_remove:
         logger.info("Evicted %d expired jobs from memory", len(to_remove))
 
@@ -89,19 +88,37 @@ def count_ongoing_jobs() -> int:
     return sum(1 for s in job_statuses.values() if s in ongoing)
 
 
-def save_result(job_id: str, result: dict):
-    """Save job result to file system"""
-    result_file = RESULTS_DIR / f"{job_id}.json"
-    with open(result_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+def _delete_result_from_storage(job_id: str) -> None:
+    """Remove result JSON from Supabase storage if configured. No-op on failure."""
+    try:
+        from ai_research_backend.storage import delete_files
+        delete_files([f"results/{job_id}.json"])
+    except Exception as exc:
+        logger.debug("Storage delete skipped for %s: %s", job_id, exc)
+
+
+def save_result(job_id: str, result: dict) -> None:
+    """Save job result in memory and optionally to Supabase Storage."""
+    job_results[job_id] = result
+    try:
+        from ai_research_backend.storage import upload_json
+        upload_json(f"results/{job_id}.json", result)
+    except Exception as exc:
+        logger.warning("Result upload to storage skipped for %s: %s", job_id, exc)
 
 
 def load_result(job_id: str) -> Optional[dict]:
-    """Load job result from file system"""
-    result_file = RESULTS_DIR / f"{job_id}.json"
-    if result_file.exists():
-        with open(result_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+    """Load job result from memory, or from Supabase Storage if not in memory."""
+    if job_id in job_results:
+        return job_results[job_id]
+    try:
+        from ai_research_backend.storage import download_json
+        data = download_json(f"results/{job_id}.json")
+        if isinstance(data, dict):
+            job_results[job_id] = data
+            return data
+    except Exception as exc:
+        logger.debug("Result load from storage skipped for %s: %s", job_id, exc)
     return None
 
 

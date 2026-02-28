@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-02-28
+
+### Fix
+- **Stuck research jobs:** Background research jobs could hang permanently at 5% "Initializing research" due to heavy deferred imports (`transformers`, `crewai`) inside the background task. A prior `OSError: [Errno 89]` during `transformers` import left partial modules in `sys.modules`, causing subsequent jobs to deadlock on the import lock. Moved all heavy imports to module-level with isolated try/except fallbacks so failures surface at startup instead of silently hanging background tasks.
+- **Missing error handling in vector search:** `_similarity_search` and `search_existing_knowledge` in `rag.py` had no try/except — a Supabase RPC hang or embedding failure would block the entire job indefinitely. Both now catch exceptions and return empty results, allowing the pipeline to fall back to ArXiv paper download.
+- **No job timeout:** Added a configurable watchdog timer (`JOB_TIMEOUT_SECONDS`, default 600s) that marks stuck jobs as `"failed"` if they exceed the deadline. Previously a hung job would stay in `"running"` state forever, also blocking new submissions when `MAX_CONCURRENT_RESEARCH_JOBS=1`.
+
+### Minor change
+- Added per-stage try/except in `run_dynamic_research_job` with granular progress updates so each phase (knowledge-base search, ArXiv download, hybrid retrieval, agent pipeline) fails independently and reports which step failed.
+- Repaired venv package metadata (`uv sync`) to resolve `OSError: [Errno 89] Operation canceled` during `importlib.metadata.packages_distributions()`.
+
 ## [0.6.0] - 2026-02-28
 
 ### Fix
