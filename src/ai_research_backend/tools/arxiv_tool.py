@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
 
 from ai_research_backend.storage import upload_file
+from ai_research_backend.image_filter import is_research_relevant, is_header_region
 
 logger = logging.getLogger(__name__)
 
@@ -72,15 +73,20 @@ class ArxivSearchTool(BaseTool):
 
                         for page_index, page in enumerate(doc[:5]):
                             text += page.get_text()
+                            page_height = page.rect.height
 
-                            image_list = page.get_images()
+                            image_list = page.get_images(full=True)
                             for img_index, img in enumerate(image_list):
                                 xref = img[0]
                                 base_image = doc.extract_image(xref)
                                 image_bytes = base_image["image"]
                                 image_ext = base_image["ext"]
 
-                                if len(image_bytes) < 1000:
+                                if not is_research_relevant(image_bytes):
+                                    continue
+
+                                bbox = page.get_image_bbox(img)
+                                if bbox and is_header_region(page_index, tuple(bbox), page_height):
                                     continue
 
                                 storage_path = f"extracted_images/{arxiv_id}_p{page_index}_i{img_index}.{image_ext}"

@@ -1,7 +1,8 @@
+import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime
 import uuid
 
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 JOB_TTL_SECONDS = 7200  # 2 hours
 MAX_STORED_JOBS = 500
+_EVENT_QUEUE_MAX = 256
 
 # In-memory job status tracking
 job_statuses: Dict[str, str] = {}
@@ -22,6 +24,10 @@ job_findings: Dict[str, list] = {}
 
 # In-memory job results (optional Supabase persistence when configured)
 job_results: Dict[str, dict] = {}
+
+# SSE event queues — one asyncio.Queue per job for streaming events to clients
+_event_queues: Dict[str, asyncio.Queue] = {}
+_event_queue_lock = threading.Lock()
 
 _eviction_lock = threading.Lock()
 
@@ -55,6 +61,8 @@ def _evict_expired_jobs() -> None:
         job_thoughts.pop(jid, None)
         job_findings.pop(jid, None)
         job_results.pop(jid, None)
+        with _event_queue_lock:
+            _event_queues.pop(jid, None)
         _delete_result_from_storage(jid)
     if to_remove:
         logger.info("Evicted %d expired jobs from memory", len(to_remove))
@@ -168,3 +176,39 @@ def add_intermediate_finding(job_id: str, finding: str):
     if job_id not in job_findings:
         job_findings[job_id] = []
     job_findings[job_id].append(finding)
+
+
+# ---------------------------------------------------------------------------
+# SSE event queue helpers
+# ---------------------------------------------------------------------------
+
+def create_event_queue(job_id: str) -> asyncio.Queue:
+    """Create (or return existing) event queue for a job."""
+    with _event_queue_lock:
+        q = _event_queues.get(job_id)
+        if q is None:
+            q = asyncio.Queue(maxsize=_EVENT_QUEUE_MAX)
+            _event_queues[job_id] = q
+        return q
+
+
+def get_event_queue(job_id: str) -> Optional[asyncio.Queue]:
+    """Return the event queue for a job, or None if not created."""
+    with _event_queue_lock:
+        return _event_queues.get(job_id)
+
+
+def push_event(job_id: str, event_type: str, data: Any) -> None:
+    """Push an SSE event onto the job's queue (non-blocking, thread-safe).
+
+    Called from background threads — uses put_nowait so it never blocks
+    the research pipeline. Silently drops if queue is full or missing.
+    """
+    with _event_queue_lock:
+        q = _event_queues.get(job_id)
+    if q is None:
+        return
+    try:
+        q.put_nowait({"event": event_type, "data": data})
+    except asyncio.QueueFull:
+        logger.debug("SSE event queue full for job %s, dropping event", job_id)

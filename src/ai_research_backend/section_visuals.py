@@ -1,4 +1,5 @@
-"""Generate section-level visual assets: rendered math equations and data charts.
+"""Generate section-level visual assets: rendered math equations, data charts,
+concept maps, and timeline visualizations.
 
 All images are rendered in-memory and uploaded to Supabase Storage.
 """
@@ -6,6 +7,7 @@ All images are rendered in-memory and uploaded to Supabase Storage.
 import io
 import logging
 import re
+import textwrap
 from typing import Dict, List, Optional
 
 import matplotlib
@@ -233,5 +235,134 @@ def generate_comparison_chart(
         return upload_file(storage_path, buf.read(), "image/png")
     except Exception as e:
         logger.debug("Failed to generate comparison chart: %s", e)
+        plt.close("all")
+        return None
+
+
+def generate_concept_map(
+    structured_sections: dict,
+    job_id: str,
+) -> Optional[str]:
+    """Generate a concept-relationship network graph from key_concepts.
+
+    Uses networkx for layout and matplotlib for rendering.
+    Returns a public image URL or None.
+    """
+    concepts = structured_sections.get("key_concepts")
+    if not concepts or not isinstance(concepts, list) or len(concepts) < 2:
+        return None
+
+    try:
+        import networkx as nx
+
+        G = nx.Graph()
+        for item in concepts:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", "").strip()
+            if not name:
+                continue
+            G.add_node(name)
+            for rel in item.get("related_concepts", []):
+                rel = rel.strip() if isinstance(rel, str) else ""
+                if rel:
+                    G.add_edge(name, rel)
+
+        if G.number_of_nodes() < 2:
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.set_title("Concept Map", fontsize=14, fontweight="bold", pad=12)
+        ax.axis("off")
+
+        pos = nx.spring_layout(G, seed=42, k=2.0 / max(1, G.number_of_nodes() ** 0.5))
+
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#B0BEC5", width=1.5, alpha=0.7)
+
+        nx.draw_networkx_nodes(
+            G, pos, ax=ax,
+            node_color="#4A90D9", node_size=1800, alpha=0.9, edgecolors="white", linewidths=2,
+        )
+
+        wrapped_labels = {n: "\n".join(textwrap.wrap(n, width=14)) for n in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels=wrapped_labels, ax=ax, font_size=8, font_color="white")
+
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+
+        storage_path = f"generated_charts/{job_id}_concept_map.png"
+        return upload_file(storage_path, buf.read(), "image/png")
+    except Exception as e:
+        logger.debug("Failed to generate concept map: %s", e)
+        plt.close("all")
+        return None
+
+
+def generate_timeline_chart(
+    structured_sections: dict,
+    job_id: str,
+) -> Optional[str]:
+    """Generate a horizontal timeline visualization from timeline events.
+
+    Returns a public image URL or None.
+    """
+    events = structured_sections.get("timeline")
+    if not events or not isinstance(events, list) or len(events) < 2:
+        return None
+
+    valid_events: List[dict] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        period = ev.get("period", "").strip()
+        event_text = ev.get("event", "").strip()
+        if period and event_text:
+            valid_events.append({"period": period, "event": event_text})
+
+    if len(valid_events) < 2:
+        return None
+
+    try:
+        n = len(valid_events)
+        fig_width = max(10, n * 2.5)
+        fig, ax = plt.subplots(figsize=(fig_width, 4))
+        ax.set_title("Timeline", fontsize=14, fontweight="bold", pad=12)
+
+        y_line = 0.5
+        ax.axhline(y=y_line, color="#4A90D9", linewidth=3, zorder=1)
+
+        for i, ev in enumerate(valid_events):
+            x = i / max(1, n - 1)
+            ax.plot(x, y_line, "o", color="#4A90D9", markersize=12, zorder=2)
+
+            above = i % 2 == 0
+            text_y = y_line + (0.25 if above else -0.25)
+            va = "bottom" if above else "top"
+
+            wrapped_event = "\n".join(textwrap.wrap(ev["event"], width=22))
+            label = f"{ev['period']}\n{wrapped_event}"
+            ax.text(
+                x, text_y, label,
+                ha="center", va=va, fontsize=7, fontweight="normal",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="#E3F2FD", edgecolor="#90CAF9"),
+            )
+
+        ax.set_xlim(-0.08, 1.08)
+        ax.set_ylim(-0.1, 1.1)
+        ax.axis("off")
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+
+        storage_path = f"generated_charts/{job_id}_timeline.png"
+        return upload_file(storage_path, buf.read(), "image/png")
+    except Exception as e:
+        logger.debug("Failed to generate timeline chart: %s", e)
         plt.close("all")
         return None

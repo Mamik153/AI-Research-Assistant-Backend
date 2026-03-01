@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-03-01
+
+### Major change
+- **SSE streaming endpoint:** Added `GET /api/research/dynamic/{job_id}/stream` for real-time Server-Sent Events streaming of research progress, findings, and results. All existing polling endpoints (`GET /api/research/{job_id}`, result endpoints) are fully preserved as a fallback. Event types: `progress`, `finding`, `result`, `error`, `done`, with periodic keepalive pings.
+- **Research image filtering:** Overhauled PDF image extraction to reject non-research images (logos, brand icons, author photos, decorative banners). Multi-layer filtering uses byte-size threshold (5 KB), pixel dimension checks (200-4000 px), aspect ratio validation, page header detection, and pixel-level classification (white background ratio, color diversity, edge density). Only diagram/graph/formula images pass through.
+- **Tavily web image search:** Integrated `tavily-python` to search for research-relevant images (architecture diagrams, graphs, figures) when processing a topic. Results are provided alongside extracted paper images to the synthesis agent for section assignment.
+- **Generated concept maps:** New `generate_concept_map()` uses networkx + matplotlib to render a network graph from `key_concepts[].related_concepts` data, uploaded to Supabase Storage and added to `section_images.key_concepts`.
+- **Generated timeline charts:** New `generate_timeline_chart()` renders a horizontal timeline visualization from `timeline[].period` and `timeline[].event` data, uploaded and added to `section_images.timeline`.
+
+### Minor change
+- Added `Pillow`, `networkx`, and `numpy` as explicit dependencies for image analysis and graph visualization.
+- SSE event queue system in `job_manager.py` with per-job `asyncio.Queue`, non-blocking thread-safe push, and automatic cleanup on job eviction.
+- Synthesis agent prompt now instructs the LLM to only assign research-relevant diagrams/graphs/formulas to sections (not arbitrary images).
+- `allowed_urls` for `section_images` normalization now includes Tavily-sourced image URLs alongside extracted paper images.
+
 ## [0.6.3] - 2026-02-28
 
 ### Fix

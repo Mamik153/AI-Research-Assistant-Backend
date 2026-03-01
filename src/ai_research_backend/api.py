@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import json
 import logging
@@ -5,14 +6,14 @@ import os
 import re
 import uuid as uuid_mod
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
@@ -41,6 +42,9 @@ from ai_research_backend.job_manager import (
     get_job_progress,
     add_intermediate_finding,
     count_ongoing_jobs,
+    create_event_queue,
+    get_event_queue,
+    push_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,7 +152,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="AI Research Backend API", version="1.0.0")
+app = FastAPI(title="AI Research Backend API", version="0.7.0")
 
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
@@ -870,14 +874,33 @@ def _fail_job(job_id: str, topic: str, reason: str) -> None:
     update_job_status(job_id, "failed")
 
 
+def _push_progress(job_id: str, step: str, pct: int, thought: str) -> None:
+    """Update polling state AND push an SSE event in one call."""
+    update_job_progress(job_id, step, pct, thought)
+    push_event(job_id, "progress", {
+        "current_step": step,
+        "progress_percentage": pct,
+        "message": thought,
+    })
+
+
+def _push_finding(job_id: str, finding: str) -> None:
+    """Record intermediate finding for polling AND push SSE event."""
+    add_intermediate_finding(job_id, finding)
+    push_event(job_id, "finding", {"finding": finding})
+
+
 def run_dynamic_research_job(job_id: str, topic: str):
     """Run the dynamic research job in background.
 
     Flow:
       1. Check persistent knowledge base for existing relevant content
       2. If insufficient, download papers from ArXiv and store in knowledge base
-      3. Run multi-agent pipeline (analyzer -> synthesis + diagrams in parallel)
-      4. Generate visual assets and prepare final result
+      3. Search Tavily for research-relevant images
+      4. Run multi-agent pipeline (analyzer -> synthesis + diagrams in parallel)
+      5. Generate visual assets and prepare final result
+
+    Progress is dual-delivered: in-memory dicts (for polling) AND SSE queue.
     """
     import threading
 
@@ -889,6 +912,7 @@ def run_dynamic_research_job(job_id: str, topic: str):
             "Job %s exceeded %ds timeout — marking failed", job_id, JOB_TIMEOUT_SECONDS
         )
         _fail_job(job_id, topic, f"Job timed out after {JOB_TIMEOUT_SECONDS}s")
+        push_event(job_id, "error", {"message": f"Job timed out after {JOB_TIMEOUT_SECONDS}s"})
 
     timer = threading.Timer(JOB_TIMEOUT_SECONDS, _watchdog)
     timer.daemon = True
@@ -896,12 +920,7 @@ def run_dynamic_research_job(job_id: str, topic: str):
 
     try:
         update_job_status(job_id, "running")
-        update_job_progress(
-            job_id,
-            "Initializing research",
-            5,
-            "Preparing to research the topic",
-        )
+        _push_progress(job_id, "Initializing research", 5, "Preparing to research the topic")
 
         # -- Gate: core modules must have loaded at startup --
         if active_llm is None or run_research_agents is None:
@@ -911,12 +930,7 @@ def run_dynamic_research_job(job_id: str, topic: str):
             )
 
         # ---- Step 1: Similarity search on existing knowledge base ----
-        update_job_progress(
-            job_id,
-            "Checking knowledge base",
-            10,
-            "Searching existing embeddings for relevant material",
-        )
+        _push_progress(job_id, "Checking knowledge base", 10, "Searching existing embeddings for relevant material")
 
         existing_context: Optional[str] = None
         if search_existing_knowledge is not None:
@@ -931,29 +945,16 @@ def run_dynamic_research_job(job_id: str, topic: str):
         papers_context: str = ""
 
         if existing_context:
-            add_intermediate_finding(
-                job_id,
-                "Found sufficient existing knowledge — skipping paper download",
-            )
+            _push_finding(job_id, "Found sufficient existing knowledge — skipping paper download")
             papers_context = existing_context
-            update_job_progress(
-                job_id,
-                "Using cached knowledge",
-                45,
-                "Relevant content found in knowledge base, proceeding to analysis",
-            )
+            _push_progress(job_id, "Using cached knowledge", 45, "Relevant content found in knowledge base, proceeding to analysis")
         else:
             # ---- Step 2: Download new papers from ArXiv ----
             from ai_research_backend.tools.arxiv_tool import ArxivSearchTool
 
             arxiv_tool = ArxivSearchTool()
 
-            update_job_progress(
-                job_id,
-                "Searching ArXiv papers",
-                20,
-                f"Searching for papers related to: {topic}",
-            )
+            _push_progress(job_id, "Searching ArXiv papers", 20, f"Searching for papers related to: {topic}")
 
             try:
                 papers = arxiv_tool.search_papers(topic)
@@ -962,22 +963,10 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 papers = []
 
             if papers:
-                add_intermediate_finding(
-                    job_id, f"Found {len(papers)} relevant research papers"
-                )
-                update_job_progress(
-                    job_id,
-                    "Processing paper content",
-                    35,
-                    f"Analyzing {len(papers)} papers",
-                )
+                _push_finding(job_id, f"Found {len(papers)} relevant research papers")
+                _push_progress(job_id, "Processing paper content", 35, f"Analyzing {len(papers)} papers")
 
-            update_job_progress(
-                job_id,
-                "Embedding papers into knowledge base",
-                45,
-                "Storing paper chunks and running hybrid retrieval",
-            )
+            _push_progress(job_id, "Embedding papers into knowledge base", 45, "Storing paper chunks and running hybrid retrieval")
 
             papers_for_context = papers[:7]
             if hybrid_retrieve is not None:
@@ -993,6 +982,18 @@ def run_dynamic_research_job(job_id: str, topic: str):
                 "cannot proceed with research"
             )
 
+        # ---- Step 2b: Search Tavily for research-relevant images ----
+        _push_progress(job_id, "Searching for research images", 48, "Looking for diagrams and figures via web search")
+
+        tavily_images: List[dict] = []
+        try:
+            from ai_research_backend.tavily_search import search_research_images
+            tavily_images = search_research_images(topic)
+            if tavily_images:
+                _push_finding(job_id, f"Found {len(tavily_images)} research images via web search")
+        except Exception as exc:
+            logger.warning("Tavily image search failed (non-fatal): %s", exc)
+
         # ---- Build section_images_instruction for synthesis agent ----
         available_image_urls: List[str] = []
         available_images_text = ""
@@ -1001,17 +1002,24 @@ def run_dynamic_research_job(job_id: str, topic: str):
             if p_images:
                 available_image_urls.extend(p_images)
                 available_images_text += (
-                    f'  - "{p.get("title", "Unknown")}": {", ".join(p_images)}\n'
+                    f'  - Paper "{p.get("title", "Unknown")}": {", ".join(p_images)}\n'
                 )
+
+        for timg in tavily_images:
+            url = timg.get("url", "")
+            desc = timg.get("description", "research diagram")
+            if url:
+                available_image_urls.append(url)
+                available_images_text += f'  - Web image ({desc}): {url}\n'
 
         if available_image_urls:
             section_images_instruction = f"""
             "section_images": {{
-                For each section key (overview, key_concepts, benefits, risks, applications, future_directions, methodologies, comparisons, timeline, statistics), provide an array of image URLs from the Available Images list below that best illustrate that section. Use ONLY URLs from this list. Use empty array if none fit.
-                Example: "overview": ["/static/extracted_images/paper_p0_i0.png"], "key_concepts": [], ...
+                For each section key (overview, key_concepts, benefits, risks, applications, future_directions, methodologies, comparisons, timeline, statistics), provide an array of image URLs from the Available Images list below that best illustrate that section. Only assign images that are clearly relevant research diagrams, architecture figures, graphs, or formulas. Use ONLY URLs from this list. Use empty array if none fit.
+                Example: "overview": ["https://example.com/diagram.png"], "key_concepts": [], ...
             }},
 
-Available Images (use ONLY these URLs in section_images):
+Available Images (use ONLY these URLs in section_images — assign only research-relevant diagrams/graphs/formulas):
 {available_images_text}"""
         else:
             section_images_instruction = '"section_images": {},'
@@ -1020,12 +1028,7 @@ Available Images (use ONLY these URLs in section_images):
             return
 
         # ---- Step 3: Multi-agent pipeline ----
-        update_job_progress(
-            job_id,
-            "Running research agents",
-            55,
-            "Paper Analyzer extracting findings, Synthesis + Diagram agents starting",
-        )
+        _push_progress(job_id, "Running research agents", 55, "Paper Analyzer extracting findings, Synthesis + Diagram agents starting")
 
         llm_data = run_research_agents(
             main_llm=active_llm,
@@ -1039,6 +1042,7 @@ Available Images (use ONLY these URLs in section_images):
             return
 
         logger.info("Multi-agent pipeline completed")
+        _push_progress(job_id, "Processing agent output", 70, "Validating and structuring agent results")
 
         valid, reason = _validate_llm_response(llm_data)
         if not valid:
@@ -1055,21 +1059,12 @@ Available Images (use ONLY these URLs in section_images):
             llm_data.get("section_confidence")
         )
 
-        allowed_urls = set()
-        for p in papers:
-            for img_url in p.get("images", []):
-                if isinstance(img_url, str):
-                    allowed_urls.add(img_url)
+        allowed_urls = set(available_image_urls)
         section_images = _normalize_section_images(
             llm_data.get("section_images"), allowed_urls
         )
 
-        update_job_progress(
-            job_id,
-            "Generating visualizations",
-            80,
-            "Creating charts and rendering math expressions",
-        )
+        _push_progress(job_id, "Generating visualizations", 80, "Creating charts, concept maps, and rendering math expressions")
 
         sections_dict = structured_sections.model_dump()
         if section_images is None:
@@ -1079,6 +1074,8 @@ Available Images (use ONLY these URLs in section_images):
                 render_section_math,
                 generate_statistics_chart,
                 generate_comparison_chart,
+                generate_concept_map,
+                generate_timeline_chart,
             )
 
             math_images = render_section_math(sections_dict, job_id)
@@ -1092,6 +1089,14 @@ Available Images (use ONLY these URLs in section_images):
             comp_chart_url = generate_comparison_chart(sections_dict, job_id)
             if comp_chart_url:
                 section_images.setdefault("comparisons", []).append(comp_chart_url)
+
+            concept_map_url = generate_concept_map(sections_dict, job_id)
+            if concept_map_url:
+                section_images.setdefault("key_concepts", []).append(concept_map_url)
+
+            timeline_url = generate_timeline_chart(sections_dict, job_id)
+            if timeline_url:
+                section_images.setdefault("timeline", []).append(timeline_url)
         except Exception as e:
             logger.warning("Section visual generation failed (non-fatal): %s", e)
 
@@ -1115,20 +1120,20 @@ Available Images (use ONLY these URLs in section_images):
             "jobId": job_id,
         }
 
-        update_job_progress(
-            job_id, "Finalizing results", 95, "Preparing final research output"
-        )
+        _push_progress(job_id, "Finalizing results", 95, "Preparing final research output")
 
         save_result(job_id, result_data)
-        update_job_progress(
-            job_id, "Completed", 100, "Dynamic research completed successfully"
-        )
+        _push_progress(job_id, "Completed", 100, "Dynamic research completed successfully")
         update_job_status(job_id, "completed")
+
+        push_event(job_id, "result", result_data)
+        push_event(job_id, "done", {"status": "completed"})
 
     except Exception as e:
         if not timed_out.is_set():
             logger.exception("Dynamic research job %s failed", job_id)
             _fail_job(job_id, topic, "An internal error occurred while processing the research job.")
+            push_event(job_id, "error", {"message": "An internal error occurred while processing the research job."})
     finally:
         timer.cancel()
 
@@ -1227,10 +1232,75 @@ async def get_dynamic_research_result(
     )
 
 
+SSE_PING_INTERVAL = 15  # seconds between keepalive pings
+SSE_STREAM_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "600")) + 30
+
+
+async def _sse_generator(job_id: str) -> AsyncGenerator[str, None]:
+    """Yield formatted SSE lines from the job's event queue."""
+    q = get_event_queue(job_id)
+    if q is None:
+        yield f"event: error\ndata: {json.dumps({'message': 'No event stream for this job'})}\n\n"
+        return
+
+    elapsed = 0.0
+    while elapsed < SSE_STREAM_TIMEOUT:
+        try:
+            msg = await asyncio.wait_for(q.get(), timeout=SSE_PING_INTERVAL)
+        except asyncio.TimeoutError:
+            yield ": ping\n\n"
+            elapsed += SSE_PING_INTERVAL
+            continue
+
+        event_type = msg.get("event", "message")
+        data = msg.get("data", {})
+        yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+        if event_type in ("done", "error", "result"):
+            return
+
+    yield f"event: error\ndata: {json.dumps({'message': 'Stream timeout'})}\n\n"
+
+
+@app.get("/api/research/dynamic/{job_id}/stream")
+@limiter.limit(RATE_LIMIT_STRING)
+async def stream_dynamic_research(
+    request: Request,
+    job_id: str,
+    _: None = Depends(verify_api_key),
+):
+    """Stream real-time progress for a dynamic research job via SSE.
+
+    Falls back to polling endpoints if the client cannot maintain the connection.
+    """
+    _validate_job_id(job_id)
+    if not job_exists(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status = get_job_status(job_id)
+    if status in ("completed", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job already {status}. Use the result endpoint instead.",
+        )
+
+    create_event_queue(job_id)
+
+    return StreamingResponse(
+        _sse_generator(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
-    return {"message": "AI Research Backend API", "version": "1.0.0"}
+    return {"message": "AI Research Backend API", "version": "0.7.0"}
 
 
 def main():
